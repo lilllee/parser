@@ -1,0 +1,40 @@
+.git
+.gitignore
+Dockerfile
+
+node_modules
+dist
+.vite
+coverage
+.cache
+
+# Local secrets and machine-specific config.
+.env
+.env.*
+!.env.example
+.envrc
+.npmrc
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Local agent/tooling state.
+.agents
+.omx
+.codegraph
+
+# Local outputs and dumps.
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+tests/_out_*.json
+tests/_smoke*

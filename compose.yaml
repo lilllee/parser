@@ -1,0 +1,38 @@
+services:
+  fs-md:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fs-md:local
+    container_name: fs-md
+    ports:
+      - "${DOCKER_PORT:-8787}:8787"
+    environment:
+      NODE_ENV: production
+      PORT: "8787"
+
+      # Use DOCKER_* variables so the local .env VLLM_URL=localhost does not
+      # accidentally point the container at itself.
+      AI_PROVIDER: "${DOCKER_AI_PROVIDER:-vllm}"
+      AI_TIMEOUT_MS: "${DOCKER_AI_TIMEOUT_MS:-60000}"
+      AI_RETRY: "${DOCKER_AI_RETRY:-1}"
+      VLLM_URL: "${DOCKER_VLLM_URL:-http://host.docker.internal:8000/v1/chat/completions}"
+      VLLM_MODEL: "${DOCKER_VLLM_MODEL:-gx10}"
+      VLLM_DISABLED: "${DOCKER_VLLM_DISABLED:-0}"
+
+      VLLM_CONCURRENCY: "${DOCKER_VLLM_CONCURRENCY:-3}"
+      VLLM_OCR_CONCURRENCY: "${DOCKER_VLLM_OCR_CONCURRENCY:-3}"
+      VLLM_OCR_TIMEOUT_MS: "${DOCKER_VLLM_OCR_TIMEOUT_MS:-240000}"
+      VLLM_OCR_RENDER_SCALE: "${DOCKER_VLLM_OCR_RENDER_SCALE:-2}"
+      VLLM_SPREAD_SPLIT: "${DOCKER_VLLM_SPREAD_SPLIT:-1}"
+      VLLM_PAGE_VISUAL: "${DOCKER_VLLM_PAGE_VISUAL:-1}"
+      VLLM_PAGE_VISUAL_MAX_KB: "${DOCKER_VLLM_PAGE_VISUAL_MAX_KB:-4000}"
+      VLLM_TABLE_ANALYSIS: "${DOCKER_VLLM_TABLE_ANALYSIS:-0}"
+      VLLM_THINKING: "${DOCKER_VLLM_THINKING:-0}"
+
+      # Keep local AI CLI providers disabled in containers by default.
+      CLAUDE_CLI_DISABLED: "1"
+      CODEX_DISABLED: "1"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

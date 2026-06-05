@@ -1,0 +1,22 @@
+{
+  "name": "fs-md",
+  "private": true,
+  "version": "0.2.0",
+  "description": "문서(PDF/HWP/HWPX/DOCX/XLSX)를 markdown 으로 변환하는 API 서버 (Hono + kordoc + 로컬 vLLM). Swagger UI 포함.",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node tests/detect.test.mjs && node tests/provider.test.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.3",
+    "@hono/swagger-ui": "^0.6.1",
+    "@napi-rs/canvas": "^1.0.0",
+    "canvas": "^3.2.3",
+    "hono": "^4.12.21",
+    "kordoc": "^2.9.0",
+    "mupdf": "^1.27.0",
+    "pdfjs-dist": "^4.10.38"
+  }
+}
