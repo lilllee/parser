@@ -1,0 +1,37 @@
+node_modules
+dist
+.vite
+.DS_Store
+*.log
+
+# env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+.npmrc
+.envrc
+
+# local tooling / cache
+.agents/
+.omx/
+.codegraph/
+.cache/
+coverage/
+
+# local db / dumps
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+tests/_out_*.json
+tests/_smoke*
