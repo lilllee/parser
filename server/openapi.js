@@ -23,7 +23,7 @@ export const openapiSpec = {
     contact: { name: "fs.md" },
     license: { name: "MIT" },
   },
-  servers: [{ url: "http://localhost:8787", description: "local server" }],
+  servers: [{ url: "/" }],
   tags: [
     { name: "convert", description: "파일 → markdown 변환" },
     { name: "system", description: "서버 상태 / 메타" },

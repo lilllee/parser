@@ -1,5 +1,6 @@
 // HTTP 서버: 라우트 + Swagger UI. 변환 로직은 convert.js, 후처리는 postprocess.js.
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import { swaggerUI } from "@hono/swagger-ui";
 import { pathToFileURL } from "node:url";
@@ -12,9 +13,16 @@ const PORT = Number(process.env.PORT || 8787);
 
 const app = new Hono();
 
+app.use("/api/*", cors({ origin: process.env.CORS_ORIGIN || "*" }));
+
 app.get("/api/health", (c) => c.json({ ok: true, kordoc: true, vllm: vllmInfo }));
 app.get("/api/vllm/check", async (c) => c.json(await checkVllmConnection()));
-app.get("/api/openapi.json", (c) => c.json(openapiSpec));
+app.get("/api/openapi.json", (c) => {
+  const u = new URL(c.req.url);
+  const host = (c.req.header("x-forwarded-host") || u.host).split(",")[0].trim();
+  const proto = (c.req.header("x-forwarded-proto") || u.protocol.replace(/:$/, "")).split(",")[0].trim();
+  return c.json({ ...openapiSpec, servers: [{ url: `${proto}://${host}` }] });
+});
 app.get("/api/docs", swaggerUI({ url: "/api/openapi.json", title: "fs.md API" }));
 
 // POST /api/convert (multipart): file + provider(+provider 설정) → { ok, markdown, metadata, pageCount }.
