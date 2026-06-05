@@ -1,13 +1,16 @@
-node_modules
-dist
-.vite
-.DS_Store
-*.log
+# dependencies
+node_modules/
 
-# env / secrets
+# logs
+*.log
+npm-debug.log*
+
+# env / secrets  (GEMINI_API_KEY 등 — .env 는 커밋 금지, 예시만 .env.example)
 .env
 .env.*
 !.env.example
+.npmrc
+.envrc
 *.pem
 *.key
 *.crt
@@ -17,8 +20,13 @@ dist
 *.pfx
 *.jks
 *.keystore
-.npmrc
-.envrc
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
 
 # local tooling / cache
 .agents/
@@ -27,11 +35,12 @@ dist
 .cache/
 coverage/
 
-# local db / dumps
+# local db / dumps / scratch
 *.db
 *.sqlite
 *.sqlite3
 *.dump
 *.bak
+*.tgz
 tests/_out_*.json
 tests/_smoke*
