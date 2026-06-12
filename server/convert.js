@@ -55,8 +55,19 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
     },
   });
   // 스캔본(텍스트 레이어 없는 PDF) → 자체 OCR fallback.
+  // kordoc 2.x 는 이미지 PDF 를 success:false + code:"IMAGE_BASED_PDF" 로 반환했지만,
+  // 3.0+ 는 success:true + isImageBased:true + 빈 markdown + warnings[NEEDS_OCR] 로 바뀌었다.
+  // (CHANGELOG 3.0.0 "NEEDS_OCR 경고 정식화") 둘 다 잡지 않으면 빈 결과가 그대로 나간다.
   let ocrInfo = null;
-  if (!result.success && result.code === "IMAGE_BASED_PDF" && enabled) {
+  const isImageBasedPdf =
+    (!result.success && result.code === "IMAGE_BASED_PDF") ||
+    (result.fileType === "pdf" && result.isImageBased === true && !(result.blocks || []).length);
+  if (isImageBasedPdf && !enabled) {
+    const err = new Error("이미지 기반 PDF (텍스트 레이어 없음) — OCR 에 AI provider 가 필요합니다.");
+    err.code = "IMAGE_BASED_PDF";
+    throw err;
+  }
+  if (isImageBasedPdf && enabled) {
     onPhase({ phase: "ocr", message: "텍스트 레이어 없음 — vLLM vision OCR 진입" });
     const r = await ocrPdfBuffer(rawBackup, {
       onPage: (i, total) =>

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
+import { streamText } from "hono/streaming";
 import { runConvert } from "./convert.js";
 import { resolveAiConfig, aiPing } from "./ai.js";
 import { PROVIDER_ALIASES, PROVIDER_CHOICES } from "./providers.js";
@@ -49,6 +50,7 @@ export function registerEvalRoutes(app) {
   app.get("/api/eval/result.md", evalRoute((c) => downloadResultMarkdown(c)));
   app.post("/api/eval/check", evalRoute(async (c) => c.json(await checkEvalProvider(await readJson(c)))));
   app.post("/api/eval/run", evalRoute(async (c) => c.json(await runEval(await readJson(c)))));
+  app.post("/api/eval/run/stream", (c) => streamEvalRun(c));
   app.post("/api/eval/batch", evalRoute(async (c) => c.json(await runBatch(await readJson(c)))));
   app.get("/api/eval/judgements", evalRoute((c) => c.json({ judgements: readJudgements() })));
   app.post("/api/eval/judgement", evalRoute(async (c) => c.json(saveJudgement(await readJson(c)))));
@@ -175,7 +177,27 @@ async function uploadCorpusFile(c) {
   return { file: uploaded, files: listCorpusFiles() };
 }
 
-async function runEval(body) {
+// 변환 진행률을 ndjson 으로 스트리밍 (한 줄당 JSON 이벤트). runConvert 의 sink 콜백을
+// 그대로 흘려보내 페이지별 OCR 진행까지 실시간으로 보여준다.
+async function streamEvalRun(c) {
+  const body = await readJson(c);
+  return streamText(c, async (stream) => {
+    const send = (obj) => stream.write(`${JSON.stringify(obj)}\n`);
+    const sink = {
+      onPhase: (p) => send({ type: "phase", ...p }),
+      onProgress: (p) => send({ type: "progress", ...p }),
+      onWarning: (w) => send({ type: "warning", ...w }),
+    };
+    try {
+      const { result } = await runEval(body, sink);
+      await send({ type: "done", result });
+    } catch (e) {
+      await send({ type: "error", error: e?.message || String(e), code: e?.code });
+    }
+  });
+}
+
+async function runEval(body, sink = {}) {
   ensureDirs();
   const file = requireFileName(body.file);
   const provider = body.provider || "vllm";
@@ -193,7 +215,7 @@ async function runEval(body) {
 
   let record;
   try {
-    const result = await runConvert(ab, file, {}, aiConfig);
+    const result = await runConvert(ab, file, sink, aiConfig);
     const elapsedMs = Math.round(performance.now() - startedAt);
     const quality = scoreMarkdown(result.markdown || "");
     const golden = await loadGolden(file);

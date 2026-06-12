@@ -37,6 +37,9 @@ const els = {
   docType: document.querySelector("#doc-type-select"),
   runSettings: document.querySelector("#run-settings"),
   settingsToggle: document.querySelector("#settings-toggle"),
+  runProgress: document.querySelector("#run-progress"),
+  runProgressFill: document.querySelector("#run-progress-fill"),
+  runProgressLabel: document.querySelector("#run-progress-label"),
   toast: document.querySelector("#toast"),
 };
 
@@ -472,9 +475,12 @@ async function runProviderBatch(providers) {
 
 async function runPayload({ provider }) {
   setBusy(true);
+  showProgress(0, "시작 중…");
+  let result = null;
   try {
-    const data = await fetchJson("/api/eval/run", {
+    const response = await fetch("/api/eval/run/stream", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         file: state.currentFile.name,
         provider,
@@ -482,15 +488,76 @@ async function runPayload({ provider }) {
         providerOverrides: collectProviderOverrides(),
       }),
     });
-    toast(data.result.ok ? "변환 완료" : `변환 실패: ${data.result.code}`);
-    await selectFile(state.currentFile.name);
-    if (data.result?.id) {
-      els.resultSelect.value = data.result.id;
-      await loadComparison(data.result.id);
+    if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+    // ndjson 스트림: 한 줄당 JSON 이벤트 (phase / progress / warning / done / error)
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try {
+          ev = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        handleRunEvent(ev, (r) => (result = r));
+      }
     }
+  } catch (e) {
+    toast(e.message || "변환 요청 실패");
   } finally {
+    hideProgress();
     setBusy(false);
   }
+
+  if (result) {
+    toast(result.ok ? "변환 완료" : `변환 실패: ${result.code || result.error || ""}`);
+    await selectFile(state.currentFile.name);
+    if (result.id) {
+      els.resultSelect.value = result.id;
+      await loadComparison(result.id);
+    }
+  }
+}
+
+function handleRunEvent(ev, setResult) {
+  if (ev.type === "progress" && typeof ev.progress === "number") {
+    showProgress(ev.progress, els.runProgressLabel.textContent);
+  } else if (ev.type === "phase") {
+    const detail = ev.message || ev.phase || "";
+    showProgress(null, detail);
+  } else if (ev.type === "done") {
+    showProgress(1, "완료");
+    setResult(ev.result);
+  } else if (ev.type === "error") {
+    setResult({ ok: false, error: ev.error, code: ev.code });
+  }
+}
+
+// progress: 0..1 = 막대 채움, null = 라벨만 갱신(막대는 불확정 애니메이션 유지)
+function showProgress(progress, label) {
+  els.runProgress.hidden = false;
+  if (label != null) els.runProgressLabel.textContent = label;
+  if (typeof progress === "number") {
+    els.runProgress.classList.remove("is-indeterminate");
+    els.runProgressFill.style.width = `${Math.max(2, Math.min(100, progress * 100))}%`;
+  } else if (!els.runProgressFill.style.width) {
+    els.runProgress.classList.add("is-indeterminate");
+  }
+}
+
+function hideProgress() {
+  els.runProgress.hidden = true;
+  els.runProgress.classList.remove("is-indeterminate");
+  els.runProgressFill.style.width = "";
 }
 
 function collectProviderOverrides() {
