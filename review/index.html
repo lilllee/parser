@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>fs.md Parse</title>
+    <link rel="stylesheet" href="/review/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <h1>Parse</h1>
+        </div>
+        <div class="file-strip">
+          <label class="upload-button" for="document-file-input">
+            <span class="upload-icon" aria-hidden="true">↑</span> Upload
+          </label>
+          <input
+            id="document-file-input"
+            type="file"
+            multiple
+            accept=".pdf,.hwp,.hwpx,.hwpml,.docx,.xlsx,.xls,.txt,.md,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff"
+          />
+          <span id="file-count" class="file-count">0 files</span>
+          <div id="file-tabs" class="file-tabs" role="tablist" aria-label="문서 선택"></div>
+        </div>
+        <div class="top-actions">
+          <a class="ghost-link" href="/api/docs" title="Swagger">Docs</a>
+          <a class="ghost-link" href="/api/eval/export.csv" title="CSV 내보내기">CSV</a>
+          <button id="refresh-button" class="ghost-link" type="button" title="새로고침">↻</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="pane source-pane">
+          <div class="pane-head">
+            <span class="pane-title">원본</span>
+            <span id="source-meta" class="pane-meta">-</span>
+          </div>
+          <div id="source-view" class="source-view">
+            <div class="empty-state">문서를 업로드하거나 선택하세요</div>
+          </div>
+        </section>
+
+        <section class="pane result-pane">
+          <div class="pane-head">
+            <div class="tabs" role="tablist" aria-label="결과 보기">
+              <button class="tab is-active" data-view="rendered" role="tab">Markdown</button>
+              <button class="tab" data-view="raw" role="tab">Raw</button>
+            </div>
+            <div class="result-tools">
+              <select id="result-select" class="result-select" aria-label="실행 결과 선택"></select>
+              <button id="diff-button" class="ghost-link" type="button" title="두 실행 결과를 나란히 비교">⇆ 비교</button>
+              <button id="export-md-button" class="ghost-link" type="button" title="markdown 다운로드">⬇ MD</button>
+            </div>
+          </div>
+          <div class="result-meta-row">
+            <span id="result-meta" class="pane-meta">-</span>
+          </div>
+          <div id="result-view" class="result-view">
+            <div class="empty-state">실행 결과가 여기에 표시됩니다</div>
+          </div>
+
+          <div class="run-dock">
+            <div id="run-settings" class="run-settings" hidden>
+              <label class="field">
+                <span>문서 종류</span>
+                <select id="doc-type-select">
+                  <option value="hwp">hwp</option>
+                  <option value="hwp-image">hwp + 이미지</option>
+                  <option value="pdf-single">pdf 단일</option>
+                  <option value="pdf-pocketbook">pdf 포켓북</option>
+                  <option value="image-ocr">이미지 OCR</option>
+                  <option value="document">기타</option>
+                </select>
+              </label>
+              <div id="provider-checks-wrap" class="field">
+                <span>비교 실행 모델 (체크 실행 대상)</span>
+                <div id="provider-checks" class="provider-checks"></div>
+              </div>
+              <div id="provider-config" class="provider-config">
+                <label class="field config-field" data-config="gemini">
+                  <span>Gemini API key</span>
+                  <input id="gemini-api-key" type="password" autocomplete="off" placeholder="GEMINI_API_KEY" />
+                </label>
+                <label class="field config-field" data-config="gemini">
+                  <span>Gemini model</span>
+                  <input id="gemini-model" type="text" placeholder="gemini-3.5-flash" />
+                </label>
+                <label class="field config-field" data-config="bedrock">
+                  <span>Bedrock region</span>
+                  <input id="bedrock-region" type="text" placeholder="us-east-1" />
+                </label>
+                <div class="field config-field" data-config="bedrock">
+                  <span>Bedrock 모델 (체크한 모델 전부 일괄 실행)</span>
+                  <div id="bedrock-model-list" class="provider-checks bedrock-model-list"></div>
+                </div>
+                <label class="field config-field" data-config="bedrock">
+                  <span>AWS profile</span>
+                  <input id="bedrock-profile" type="text" autocomplete="off" placeholder="default" />
+                </label>
+                <label class="field config-field" data-config="bedrock">
+                  <span>AWS access key</span>
+                  <input id="bedrock-access-key-id" type="password" autocomplete="off" placeholder="AWS_ACCESS_KEY_ID" />
+                </label>
+                <label class="field config-field" data-config="bedrock">
+                  <span>AWS secret key</span>
+                  <input id="bedrock-secret-access-key" type="password" autocomplete="off" placeholder="AWS_SECRET_ACCESS_KEY" />
+                </label>
+                <label class="field config-field" data-config="bedrock">
+                  <span>AWS session token</span>
+                  <input id="bedrock-session-token" type="password" autocomplete="off" placeholder="optional" />
+                </label>
+                <label class="field config-field" data-config="claude_cli">
+                  <span>Claude CLI model</span>
+                  <input id="claude-cli-model" type="text" placeholder="sonnet" />
+                </label>
+                <label class="field config-field" data-config="codex_cli">
+                  <span>Codex CLI model</span>
+                  <input id="codex-cli-model" type="text" placeholder="config default" />
+                </label>
+              </div>
+            </div>
+            <div class="run-bar">
+              <button id="settings-toggle" class="ghost-link" type="button" aria-expanded="false" aria-controls="run-settings">⚙ 설정</button>
+              <button id="batch-button" class="secondary-button" type="button" title="체크한 모델 전부 실행">비교 실행</button>
+              <select id="provider-select" class="provider-select" aria-label="모델 선택"></select>
+              <button id="run-button" class="primary-button" type="button">Run Parse ↑</button>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/review/app.js" type="module"></script>
+  </body>
+</html>

@@ -3,6 +3,8 @@
 const VLLM_URL_DEFAULT = process.env.VLLM_URL || "http://localhost:8000/v1/chat/completions";
 const VLLM_MODEL_DEFAULT = process.env.VLLM_MODEL || "qwen";
 const VLLM_THINKING_DEFAULT = process.env.VLLM_THINKING === "1";
+const BEDROCK_REGION_DEFAULT = process.env.BEDROCK_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
+const BEDROCK_MODEL_DEFAULT = process.env.BEDROCK_MODEL || "anthropic.claude-3-5-sonnet-20241022-v2:0";
 
 export const openapiSpec = {
   openapi: "3.1.0",
@@ -56,6 +58,7 @@ export const openapiSpec = {
                   markdown: "# 문서 제목\n\n본문...",
                   metadata: { pageCount: 1, createdAt: "2026-05-13T10:00:42" },
                   pageCount: 1,
+                  elapsedMs: 13842,
                 },
               },
             },
@@ -65,7 +68,7 @@ export const openapiSpec = {
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/ErrorBody" },
-                example: { ok: false, error: 'file 필드가 필요합니다.' },
+                example: { ok: false, error: "file 필드가 필요합니다.", elapsedMs: 3 },
               },
             },
           },
@@ -74,7 +77,7 @@ export const openapiSpec = {
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/ErrorBody" },
-                example: { ok: false, error: "이미지 기반 PDF (1페이지, 0자)", code: "IMAGE_BASED_PDF" },
+                example: { ok: false, error: "이미지 기반 PDF (1페이지, 0자)", code: "IMAGE_BASED_PDF", elapsedMs: 912 },
               },
             },
           },
@@ -106,7 +109,7 @@ export const openapiSpec = {
         type: "object",
         required: ["file"],
         description:
-          "provider 에 따라 쓰이는 설정 필드가 다르다 — vllm: url/model/thinking · openai·anthropic·gemini: api_key/model/base_url · claude_cli·codex_cli: model. 생략한 값은 서버 .env 기본값을 쓴다.",
+          "provider 에 따라 쓰이는 설정 필드가 다르다 — vllm: url/model/thinking · openai·anthropic: api_key/model/base_url · gemini: api_key/model/base_url(generateContent) · bedrock: region/model/profile/access_key_id/secret_access_key/session_token · claude_cli·codex_cli: model. 생략한 값은 서버 .env 기본값을 쓴다.",
         properties: {
           file: {
             type: "string",
@@ -115,7 +118,7 @@ export const openapiSpec = {
           },
           provider: {
             type: "string",
-            enum: ["vllm", "openai", "anthropic", "gemini", "claude_cli", "codex_cli"],
+            enum: ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli"],
             default: "vllm",
             description: "AI 백엔드 (OCR·시각자료 분석). 미지정 시 vllm.",
           },
@@ -127,7 +130,7 @@ export const openapiSpec = {
           model: {
             type: "string",
             default: VLLM_MODEL_DEFAULT,
-            description: "모델 id. vllm/openai/anthropic/codex_cli·claude_cli 공통(provider 별 기본값 적용). 표시 기본값은 vllm 기준.",
+            description: "모델 id. vllm/openai/anthropic/gemini/bedrock/codex_cli·claude_cli 공통(provider 별 기본값 적용). 표시 기본값은 vllm 기준.",
           },
           thinking: {
             type: "boolean",
@@ -140,7 +143,30 @@ export const openapiSpec = {
           },
           base_url: {
             type: "string",
-            description: "[openai / anthropic / gemini] base URL. 생략 시 공식 기본 엔드포인트.",
+            description: "[openai / anthropic / gemini] base URL. gemini 는 기본 https://generativelanguage.googleapis.com/v1beta 를 사용하고 /models/{model}:generateContent 를 붙인다.",
+          },
+          region: {
+            type: "string",
+            default: BEDROCK_REGION_DEFAULT,
+            description: "[bedrock] AWS region. BEDROCK_REGION / AWS_REGION / AWS_DEFAULT_REGION 기본값 사용.",
+          },
+          profile: {
+            type: "string",
+            description: "[bedrock] AWS shared credentials/config profile. 미지정 시 기본 AWS credential chain 사용.",
+          },
+          access_key_id: {
+            type: "string",
+            description: "[bedrock] 임시 명시 credentials. 가능하면 AWS_PROFILE 또는 서버 env 사용 권장.",
+          },
+          secret_access_key: {
+            type: "string",
+            format: "password",
+            description: "[bedrock] 임시 명시 credentials secret.",
+          },
+          session_token: {
+            type: "string",
+            format: "password",
+            description: "[bedrock] STS/session credentials 사용 시 optional token.",
           },
         },
       },
@@ -159,6 +185,11 @@ export const openapiSpec = {
             type: "integer",
             nullable: true,
             description: "PDF 페이지 수 / HWP·HWPX 섹션 수 / XLSX 시트 수",
+          },
+          elapsedMs: {
+            type: "integer",
+            minimum: 0,
+            description: "요청 수신부터 최종 응답 직전까지의 전체 변환 처리 시간(ms)",
           },
           error: { type: "string", description: "ok=false 일 때 에러 메시지" },
           code: { type: "string", description: "ok=false 일 때 에러 코드 (IMAGE_BASED_PDF, BAD_PROVIDER 등)" },
@@ -189,6 +220,11 @@ export const openapiSpec = {
           ok: { type: "boolean", example: false },
           error: { type: "string" },
           code: { type: "string" },
+          elapsedMs: {
+            type: "integer",
+            minimum: 0,
+            description: "요청 수신부터 에러 응답 직전까지의 처리 시간(ms)",
+          },
         },
       },
     },

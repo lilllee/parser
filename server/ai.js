@@ -1,6 +1,6 @@
 // 교체 가능한 AI 프로바이더 추상화. provider/설정은 요청마다 resolveAiConfig 로 만들고
 // withAiConfig() 로 감싸면 그 안의 aiComplete() 들이 그 설정을 쓴다(AsyncLocalStorage).
-// 생략한 값은 .env 기본값. provider: vllm | openai | anthropic | claude-cli | codex-cli | codex.
+// 생략한 값은 .env 기본값. provider: vllm | openai | anthropic | bedrock | claude-cli | codex-cli | codex.
 
 import { existsSync, readFileSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -49,20 +49,76 @@ function currentAiConfig() {
   return aiStore.getStore() || resolveAiConfig();
 }
 
+// 토큰 한도 잘림(finish_reason=length 등) 시 max_tokens 를 키워 재시도하는 상한.
+const MAX_TOKENS_CAP = Number(process.env.AI_MAX_TOKENS_CAP || 8192);
+
+// provider 별 응답에서 "출력이 토큰 한도에서 잘렸는가"를 판별 (OpenAI/vLLM · Anthropic · Gemini).
+function isTruncated(json) {
+  const reason =
+    json?.choices?.[0]?.finish_reason ?? json?.stop_reason ?? json?.candidates?.[0]?.finishReason;
+  return reason === "length" || reason === "max_tokens" || reason === "MAX_TOKENS";
+}
+
 export async function aiComplete({
+  system,
   prompt,
   text,
   image,
   maxTokens = 512,
   temperature = 0.2,
+  topP,
+  presencePenalty,
+  repetitionPenalty,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 }) {
-  const { provider: p, cfg } = currentAiConfig();
+  const ai = currentAiConfig();
+  const { provider: p, cfg } = ai;
   if (!p.enabled(cfg)) return "";
-  if (p.complete) return p.complete(cfg, { prompt, text, image, maxTokens, temperature, timeoutMs });
-  const req = p.build(cfg, { prompt, text, image, maxTokens, temperature });
-  const json = await fetchJson(req, timeoutMs);
-  return p.parse(json);
+  // system 메시지는 vllm/openai(supportsSystem)만 별도 메시지로 보낸다 — 모든 요청에서
+  // byte 동일한 공통 지시문이 맨 앞에 오게 해 vLLM prefix cache 를 살린다.
+  // 미지원 provider 는 기존 동작 보존을 위해 prompt 앞에 병합.
+  let sys = system;
+  let userPrompt = prompt;
+  if (sys && !p.supportsSystem) {
+    userPrompt = `${sys}\n\n${prompt}`;
+    sys = undefined;
+  }
+  // 호출 통계 (aiConfig.stats 가 달려 있을 때만) — 변환 결과에 "AI 가 실제로 몇 번
+  // 불렸는지/몇 번 실패했는지"를 남겨, 호출 0회·조용한 실패를 화면에서 식별 가능하게.
+  if (ai.stats) ai.stats.calls++;
+  try {
+    if (p.complete) return await p.complete(cfg, { prompt: userPrompt, text, image, maxTokens, temperature, timeoutMs });
+    // 잘림 감지 시 max_tokens 를 2배로 올려 1회 재시도. 빽빽한 페이지(통계표 등)에서
+    // 출력 뒷부분이 조용히 유실되는 문제 방지 (CLI provider 는 finish_reason 이 없어 제외).
+    let tokens = maxTokens;
+    for (;;) {
+      const req = p.build(cfg, {
+        system: sys,
+        prompt: userPrompt,
+        text,
+        image,
+        maxTokens: tokens,
+        temperature,
+        topP,
+        presencePenalty,
+        repetitionPenalty,
+      });
+      const json = await fetchJson(req, timeoutMs);
+      if (isTruncated(json)) {
+        const next = Math.min(tokens * 2, MAX_TOKENS_CAP);
+        if (next > tokens) {
+          console.warn(`[ai] 출력이 max_tokens=${tokens} 에서 잘림 — ${next} 로 재시도`);
+          tokens = next;
+          continue;
+        }
+        console.warn(`[ai] max_tokens=${tokens} (상한) 에서도 잘림 — 부분 출력 반환`);
+      }
+      return p.parse(json);
+    }
+  } catch (e) {
+    if (ai.stats) ai.stats.failures++;
+    throw e;
+  }
 }
 
 export function aiEnabled(aiConfig) {
@@ -85,8 +141,8 @@ export const aiInfo = (() => {
 })();
 export const AI_ENABLED = aiInfo.enabled;
 
-export async function aiCheck() {
-  const ai = resolveAiConfig();
+// 임의 aiConfig 로 연결 점검 — 자격증명/리전/모델 접근 문제를 변환 전에 드러낸다.
+export async function aiPing(ai) {
   const { id, provider: p, cfg } = ai;
   if (!p.enabled(cfg)) return { ok: false, enabled: false, provider: id, error: `${id} provider 미설정` };
   try {
@@ -99,6 +155,10 @@ export async function aiCheck() {
   }
 }
 
+export async function aiCheck() {
+  return aiPing(resolveAiConfig());
+}
+
 export function formatAiError(e) {
   const parts = [];
   if (e?.name) parts.push(e.name);
@@ -106,6 +166,13 @@ export function formatAiError(e) {
   if (e?.cause?.code) parts.push(`cause=${e.cause.code}`);
   if (e?.cause?.message) parts.push(`causeMessage=${e.cause.message}`);
   return parts.join(" | ") || String(e);
+}
+
+// 재시도 가치가 있는 실패만 재시도: 429/5xx/네트워크/타임아웃. 그 외 4xx(잘못된 요청,
+// 컨텍스트 초과 등)는 같은 요청을 다시 보내도 똑같이 실패하므로 즉시 던진다.
+function isRetryable(e) {
+  if (e?.status != null) return e.status === 429 || e.status >= 500;
+  return true; // status 없음 = 네트워크/abort(타임아웃) 계열
 }
 
 async function fetchJson(req, timeoutMs) {
@@ -122,13 +189,19 @@ async function fetchJson(req, timeoutMs) {
       });
       if (!resp.ok) {
         const detail = await resp.text().catch(() => "");
-        throw new Error(`HTTP ${resp.status} ${detail.slice(0, 200)}`);
+        const err = new Error(`HTTP ${resp.status} ${detail.slice(0, 200)}`);
+        err.status = resp.status;
+        const ra = Number(resp.headers.get("retry-after"));
+        if (Number.isFinite(ra) && ra > 0) err.retryAfterMs = ra * 1000;
+        throw err;
       }
       return await resp.json();
     } catch (e) {
       lastError = e;
-      if (attempt >= RETRIES) break;
-      await new Promise((r) => setTimeout(r, 500));
+      if (attempt >= RETRIES || !isRetryable(e)) break;
+      // 지수 백오프 + 지터 (Retry-After 가 있으면 그 값을 우선)
+      const backoff = e?.retryAfterMs ?? 500 * 2 ** attempt + Math.floor(Math.random() * 250);
+      await new Promise((r) => setTimeout(r, backoff));
     } finally {
       clearTimeout(timer);
     }
@@ -140,7 +213,7 @@ function loadLocalEnv() {
   const files = [process.env.VLLM_ENV_FILE, ".env.local", ".env"].filter(Boolean);
   const loaded = [];
   // AI 설정 키는 로컬 .env 값을 우선 적용(개발 편의). 그 외 키는 기존 env 보존.
-  const PRIORITY = /^(VLLM_|AI_|OPENAI_|ANTHROPIC_|GEMINI_|CODEX_|CLAUDE_)/;
+  const PRIORITY = /^(VLLM_|AI_|OPENAI_|ANTHROPIC_|GEMINI_|BEDROCK_|AWS_|CODEX_|CLAUDE_)/;
   for (const file of files) {
     if (!existsSync(file)) continue;
     loaded.push(file);

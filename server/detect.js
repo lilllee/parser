@@ -55,20 +55,74 @@ export function glyphNoiseScore(block) {
   return weird + iconPrefix;
 }
 
-// 망가진 페이지 번호(1-based) 오름차순, 중복 제거.
-export function detectMangledPages(blocks) {
+// 차트 축눈금 잔해: "0% 10% 20% 30%…"(%눈금 4개+) 또는 한 줄이 통째로
+// "80 70 60 50 40…"(1~3자리 숫자 5개+)인 경우 — kordoc 이 차트를 텍스트로 흩뿌린 신호.
+export function hasAxisTickRun(block) {
+  let t = block.text || "";
+  if (!t && block.table?.cells) t = block.table.cells.flat().map((c) => c?.text || "").join("\n");
+  if (!t) return false;
+  const pctRun = new RegExp(`(?:\\d{1,3}\\s*%\\s+){${cfg.chartArtifact.percentTickMin - 1},}\\d{1,3}\\s*%`);
+  if (pctRun.test(t)) return true;
+  const numRun = new RegExp(`^\\s*(?:\\d{1,3}\\s+){${cfg.chartArtifact.numberTickMin - 1},}\\d{1,3}\\s*$`, "m");
+  return numRun.test(t);
+}
+
+// 원형/막대 차트 라벨이 표 셀 하나에 뭉친 경우 ("48.9% 23.7% 41.6%" 한 셀).
+export function isPercentCramTable(table) {
+  if (!table?.cells) return false;
+  return table.cells.flat().some((c) => {
+    const tokens = ((c?.text || "").match(/\d+(?:\.\d+)?\s*%/g) || []).length;
+    return tokens >= cfg.chartArtifact.cellPercentTokens;
+  });
+}
+
+// 블록의 텍스트 글자수 (표는 셀 텍스트 합산).
+function blockChars(b) {
+  if (b.text) return b.text.length;
+  if (b.table?.cells) {
+    return b.table.cells.flat().reduce((s, c) => s + (c?.text || "").length, 0);
+  }
+  return 0;
+}
+
+// 저밀도 페이지(1-based Set): 블록이 아예 없거나(전면 이미지/부분 스캔) 글자수가
+// 문서 중앙값 대비 극단적으로 적은 페이지 — kordoc 이 사실상 추출 실패한 페이지.
+export function detectLowDensityPages(blocks, pageCount = 0) {
+  const chars = new Map(); // page -> chars
+  for (const b of blocks || []) {
+    if (!b.pageNumber) continue;
+    chars.set(b.pageNumber, (chars.get(b.pageNumber) || 0) + blockChars(b));
+  }
+  const counts = [...chars.values()].filter((n) => n > 0).sort((a, b) => a - b);
+  if (!counts.length) return new Set(); // 텍스트가 전혀 없으면 IMAGE_BASED_PDF 경로 소관
+  const mid = Math.floor(counts.length / 2);
+  const median = counts.length % 2 ? counts[mid] : (counts[mid - 1] + counts[mid]) / 2;
+
+  const pages = new Set();
+  for (let pn = 1; pn <= pageCount; pn++) {
+    const n = chars.get(pn) || 0;
+    if (n === 0) pages.add(pn); // 블록 0개 = kordoc 이 아무것도 못 읽음
+    else if (n < median * cfg.lowDensity.medianRatio && n <= cfg.lowDensity.maxChars) pages.add(pn);
+  }
+  return pages;
+}
+
+// 망가진 페이지 번호(1-based) 오름차순, 중복 제거. pageCount 를 주면 저밀도 신호도 포함.
+export function detectMangledPages(blocks, pageCount = 0) {
   const pages = new Set();
   const glyphByPage = new Map();
   for (const b of blocks || []) {
     if (!b.pageNumber) continue;
-    if (b.type === "table" && (isProseFakeTable(b.table) || isGarbledDataTable(b.table))) {
+    if (b.type === "table" && (isProseFakeTable(b.table) || isGarbledDataTable(b.table) || isPercentCramTable(b.table))) {
       pages.add(b.pageNumber);
     } else if (isPipeTableParagraph(b) || hasBrokenKoreanSpacing(b)) {
       pages.add(b.pageNumber);
     }
+    if (hasAxisTickRun(b)) pages.add(b.pageNumber);
     const g = glyphNoiseScore(b);
     if (g) glyphByPage.set(b.pageNumber, (glyphByPage.get(b.pageNumber) || 0) + g);
   }
   for (const [pn, count] of glyphByPage) if (count >= cfg.glyphNoise.pageThreshold) pages.add(pn);
+  if (pageCount > 0) for (const pn of detectLowDensityPages(blocks, pageCount)) pages.add(pn);
   return [...pages].sort((a, b) => a - b);
 }

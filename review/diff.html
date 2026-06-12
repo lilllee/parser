@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>결과 비교 · fs.md Parse</title>
+    <link rel="stylesheet" href="/review/styles.css" />
+  </head>
+  <body class="diff-window">
+    <div class="diff-dialog-head">
+      <div class="diff-selects">
+        <select id="diff-left-select" aria-label="왼쪽 결과"></select>
+        <span class="diff-vs">↔</span>
+        <select id="diff-right-select" aria-label="오른쪽 결과"></select>
+        <button id="diff-swap" class="ghost-link" type="button" title="좌우 교체">⇄</button>
+      </div>
+      <div class="diff-dialog-tools">
+        <label class="diff-only-toggle"><input type="checkbox" id="diff-only-changes" checked /> 다른 점만</label>
+        <div class="font-stepper" role="group" aria-label="글자 크기">
+          <button id="diff-font-dec" class="step-btn" type="button" title="글자 작게" aria-label="글자 작게">A−</button>
+          <span id="diff-font-label" class="font-label">14px</span>
+          <button id="diff-font-inc" class="step-btn" type="button" title="글자 크게" aria-label="글자 크게">A＋</button>
+        </div>
+        <span id="diff-stats" class="diff-stats">-</span>
+      </div>
+    </div>
+    <div id="diff-body" class="diff-body"><div class="empty-state">불러오는 중…</div></div>
+    <script src="/review/diff.js" type="module"></script>
+  </body>
+</html>

@@ -3,15 +3,21 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmSyn
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
+import { fromIni } from "@aws-sdk/credential-providers";
 
 function openaiChatParse(json) {
   return json?.choices?.[0]?.message?.content?.trim() || "";
 }
 
 // 로컬 vLLM (OpenAI 호환). thinking 켜면 사고 토큰이 답을 다 먹어 비므로 기본 OFF.
+// system 메시지 지원: OCR 공통 지시문을 byte 동일하게 맨 앞에 보내 prefix cache 를 살린다.
+// 샘플링 파라미터(topP 등)는 명시된 것만 body 에 포함 — 서버 기본값(채팅용 0.6/1.1)이
+// 표·반복 텍스트 전사에 부적합해 추출 호출에서 명시적으로 덮어쓴다.
 const vllmProvider = {
   id: "vllm",
   fields: ["url", "model", "thinking"],
+  supportsSystem: true,
   defaults: () => ({
     url: process.env.VLLM_URL || "",
     model: process.env.VLLM_MODEL || "qwen",
@@ -19,20 +25,27 @@ const vllmProvider = {
   }),
   enabled: (cfg) => !!cfg.url && process.env.VLLM_DISABLED !== "1",
   info: (cfg) => ({ url: cfg.url, model: cfg.model, thinking: !!cfg.thinking }),
-  build(cfg, { prompt, text, image, maxTokens, temperature }) {
+  build(cfg, { system, prompt, text, image, maxTokens, temperature, topP, presencePenalty, repetitionPenalty }) {
     const content = [{ type: "text", text: prompt }];
     if (text) content.push({ type: "text", text });
     if (image) content.push({ type: "image_url", image_url: { url: image } });
+    const messages = [];
+    if (system) messages.push({ role: "system", content: system });
+    messages.push({ role: "user", content });
+    const body = {
+      model: cfg.model,
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+      chat_template_kwargs: { enable_thinking: !!cfg.thinking },
+    };
+    if (topP != null) body.top_p = topP;
+    if (presencePenalty != null) body.presence_penalty = presencePenalty;
+    if (repetitionPenalty != null) body.repetition_penalty = repetitionPenalty;
     return {
       url: cfg.url,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: cfg.model,
-        messages: [{ role: "user", content }],
-        max_tokens: maxTokens,
-        temperature,
-        chat_template_kwargs: { enable_thinking: !!cfg.thinking },
-      }),
+      body: JSON.stringify(body),
     };
   },
   parse: openaiChatParse,
@@ -42,6 +55,7 @@ const vllmProvider = {
 const openaiProvider = {
   id: "openai",
   fields: ["api_key", "model", "base_url"],
+  supportsSystem: true,
   defaults: () => ({
     base_url: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1/chat/completions",
     model: process.env.OPENAI_MODEL || "gpt-4o-mini",
@@ -49,52 +63,77 @@ const openaiProvider = {
   }),
   enabled: (cfg) => !!cfg.api_key,
   info: (cfg) => ({ url: cfg.base_url, model: cfg.model }),
-  build(cfg, { prompt, text, image, maxTokens, temperature }) {
+  build(cfg, { system, prompt, text, image, maxTokens, temperature, topP, presencePenalty }) {
     const content = [{ type: "text", text: prompt }];
     if (text) content.push({ type: "text", text });
     if (image) content.push({ type: "image_url", image_url: { url: image } });
+    const messages = [];
+    if (system) messages.push({ role: "system", content: system });
+    messages.push({ role: "user", content });
+    const body = {
+      model: cfg.model,
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+    };
+    if (topP != null) body.top_p = topP;
+    if (presencePenalty != null) body.presence_penalty = presencePenalty;
     return {
       url: cfg.base_url,
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.api_key}` },
-      body: JSON.stringify({
-        model: cfg.model,
-        messages: [{ role: "user", content }],
-        max_tokens: maxTokens,
-        temperature,
-      }),
+      body: JSON.stringify(body),
     };
   },
   parse: openaiChatParse,
   pingPrompt: "Reply with the single word: ping",
 };
 
-// Google Gemini — OpenAI 호환 엔드포인트(Bearer + image_url). 키는 GEMINI_API_KEY.
+function geminiParse(json) {
+  return (json?.candidates?.[0]?.content?.parts || [])
+    .filter((p) => typeof p.text === "string")
+    .map((p) => p.text)
+    .join("")
+    .trim();
+}
+
+function geminiGenerateUrl(baseUrl, model) {
+  const base = String(baseUrl || "https://generativelanguage.googleapis.com/v1beta")
+    .replace(/\/openai\/chat\/completions\/?$/, "")
+    .replace(/\/$/, "");
+  if (base.includes(":generateContent")) return base;
+  return `${base}/models/${encodeURIComponent(model)}:generateContent`;
+}
+
+// Google Gemini native generateContent API. 키는 GEMINI_API_KEY 또는 요청 api_key.
 const geminiProvider = {
   id: "gemini",
   fields: ["api_key", "model", "base_url"],
   defaults: () => ({
-    base_url: process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+    base_url: process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta",
+    model: process.env.GEMINI_MODEL || "gemini-3.5-flash",
     api_key: process.env.GEMINI_API_KEY || "",
   }),
   enabled: (cfg) => !!cfg.api_key,
-  info: (cfg) => ({ url: cfg.base_url, model: cfg.model }),
+  info: (cfg) => ({ url: geminiGenerateUrl(cfg.base_url, cfg.model), model: cfg.model }),
   build(cfg, { prompt, text, image, maxTokens, temperature }) {
-    const content = [{ type: "text", text: prompt }];
-    if (text) content.push({ type: "text", text });
-    if (image) content.push({ type: "image_url", image_url: { url: image } });
+    const parts = [{ text: text ? `${prompt}\n\n${text}` : prompt }];
+    if (image) {
+      const m = /^data:([^;]+);base64,(.*)$/s.exec(image);
+      if (m) parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
+    }
     return {
-      url: cfg.base_url,
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.api_key}` },
+      url: geminiGenerateUrl(cfg.base_url, cfg.model),
+      headers: { "Content-Type": "application/json", "X-goog-api-key": cfg.api_key },
       body: JSON.stringify({
-        model: cfg.model,
-        messages: [{ role: "user", content }],
-        max_tokens: maxTokens,
-        temperature,
+        contents: [{ parts }],
+        generationConfig: {
+          maxOutputTokens: maxTokens,
+          temperature,
+        },
       }),
     };
   },
-  parse: openaiChatParse,
+  parse: geminiParse,
   pingPrompt: "Reply with the single word: ping",
 };
 
@@ -161,6 +200,92 @@ const anthropicProvider = {
       .map((b) => b.text)
       .join("")
       .trim();
+  },
+  pingPrompt: "Reply with the single word: ping",
+};
+
+const BEDROCK_DEFAULT_MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0";
+
+function bedrockCredentials(cfg) {
+  if (cfg.access_key_id && cfg.secret_access_key) {
+    return {
+      accessKeyId: cfg.access_key_id,
+      secretAccessKey: cfg.secret_access_key,
+      ...(cfg.session_token ? { sessionToken: cfg.session_token } : {}),
+    };
+  }
+  return cfg.profile ? fromIni({ profile: cfg.profile }) : undefined;
+}
+
+function bedrockImageBlock(dataUrl) {
+  const m = /^data:([^;]+);base64,(.*)$/s.exec(dataUrl || "");
+  if (!m) return null;
+  const format = {
+    "image/png": "png",
+    "image/jpeg": "jpeg",
+    "image/jpg": "jpeg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+  }[m[1].toLowerCase()];
+  if (!format) throw new Error(`Bedrock Converse image 미지원 mime: ${m[1]}`);
+  return { format, source: { bytes: Buffer.from(m[2], "base64") } };
+}
+
+function parseBedrockConverse(out) {
+  return (out?.output?.message?.content || [])
+    .filter((b) => typeof b.text === "string")
+    .map((b) => b.text)
+    .join("")
+    .trim();
+}
+
+const bedrockProvider = {
+  id: "bedrock",
+  fields: ["region", "model", "profile", "access_key_id", "secret_access_key", "session_token"],
+  defaults: () => ({
+    region: process.env.BEDROCK_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1",
+    model: process.env.BEDROCK_MODEL || BEDROCK_DEFAULT_MODEL,
+    profile: process.env.BEDROCK_PROFILE || process.env.AWS_PROFILE || "",
+    access_key_id: process.env.BEDROCK_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID || "",
+    secret_access_key: process.env.BEDROCK_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY || "",
+    session_token: process.env.BEDROCK_SESSION_TOKEN || process.env.AWS_SESSION_TOKEN || "",
+  }),
+  enabled: (cfg) => !!cfg.model && process.env.BEDROCK_DISABLED !== "1",
+  info: (cfg) => ({
+    region: cfg.region,
+    model: cfg.model,
+    profile: cfg.profile || undefined,
+    credentials: cfg.access_key_id ? "explicit" : cfg.profile ? "profile" : "default-chain",
+  }),
+  async complete(cfg, { prompt, text, image, maxTokens, temperature, timeoutMs }) {
+    const client = new BedrockRuntimeClient({
+      region: cfg.region,
+      credentials: bedrockCredentials(cfg),
+    });
+    const content = [];
+    if (image) {
+      const imageBlock = bedrockImageBlock(image);
+      if (imageBlock) content.push({ image: imageBlock });
+    }
+    content.push({ text: text ? `${prompt}\n\n${text}` : prompt });
+
+    const command = new ConverseCommand({
+      modelId: cfg.model,
+      messages: [{ role: "user", content }],
+      inferenceConfig: {
+        maxTokens,
+        temperature,
+      },
+    });
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const out = await client.send(command, { abortSignal: ac.signal });
+      return parseBedrockConverse(out);
+    } finally {
+      clearTimeout(timer);
+    }
   },
   pingPrompt: "Reply with the single word: ping",
 };
@@ -317,6 +442,7 @@ export const PROVIDERS = {
   vllm: vllmProvider,
   openai: openaiProvider,
   anthropic: anthropicProvider,
+  bedrock: bedrockProvider,
   gemini: geminiProvider,
   codex: codexProvider,
   "claude-cli": claudeCliProvider,
@@ -325,4 +451,4 @@ export const PROVIDERS = {
 
 export const PROVIDER_ALIASES = { claude_cli: "claude-cli", codex_cli: "codex-cli" };
 
-export const PROVIDER_CHOICES = ["vllm", "openai", "anthropic", "gemini", "claude_cli", "codex_cli"];
+export const PROVIDER_CHOICES = ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli"];

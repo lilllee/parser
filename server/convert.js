@@ -95,11 +95,17 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
   // 망가진/펼침면 페이지만 골라 vision OCR 로 재추출해 교체 (reflow).
   let reflowInfo = null;
   if (enabled && !ocrInfo && result.fileType === "pdf" && (result.blocks || []).length) {
-    const mangled = detectMangledPages(result.blocks);
+    const mangled = detectMangledPages(result.blocks, result.pageCount || 0);
+    const qualityOcr = (result.pageQuality || []).filter((q) => q.needsOcr).map((q) => q.page);
+    if (qualityOcr.length) {
+      console.log(`[quality] kordoc needsOcr 페이지: ${qualityOcr.join(",")}`);
+      for (const pn of qualityOcr) if (!mangled.includes(pn)) mangled.push(pn);
+      mangled.sort((a, b) => a - b);
+    }
     // 펼침면(2-page spread)은 단어가 멀쩡해 텍스트 신호로 안 잡히므로 페이지 기하로 추가 감지.
     let spreadPages = new Set();
     try {
-      ({ spreadPages } = await detectSpreadPages(rawBackup.slice(0)));
+      ({ spreadPages } = await detectSpreadPages(rawBackup.slice(0), result.blocks));
     } catch (e) {
       console.warn("[spread] detect failed:", e?.message || e);
     }
@@ -172,7 +178,7 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
   };
 }
 
-// reflow 된 페이지의 블록들을 OCR 텍스트 paragraph 1개로 치환(순서·union bbox 유지).
+// reflow 된 페이지의 블록들을 OCR 텍스트 블록들로 치환(순서·union bbox 유지).
 function reflowBlocksWithOcr(blocks, texts) {
   const bboxByPage = new Map();
   for (const b of blocks) {
@@ -185,12 +191,11 @@ function reflowBlocksWithOcr(blocks, texts) {
     const pn = b.pageNumber;
     if (texts.has(pn)) {
       if (!emitted.has(pn)) {
-        out.push({
-          type: "paragraph",
-          text: texts.get(pn),
-          pageNumber: pn,
-          bbox: bboxByPage.get(pn),
-        });
+        const bbox = bboxByPage.get(pn);
+        const chunks = String(texts.get(pn)).split(/\n{2,}/).map((t) => t.trim()).filter(Boolean);
+        for (const chunk of chunks.length ? chunks : [texts.get(pn)]) {
+          out.push({ type: "paragraph", text: chunk, pageNumber: pn, bbox });
+        }
         emitted.add(pn);
       }
       continue;

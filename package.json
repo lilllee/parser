@@ -7,15 +7,19 @@
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
-    "test": "node tests/detect.test.mjs && node tests/provider.test.mjs"
+    "test": "node tests/detect.test.mjs && node tests/provider.test.mjs && node tests/enrich-format.test.mjs && node tests/eval.test.mjs",
+    "test:detect": "node tests/detect-precision.mjs",
+    "test:accuracy": "node tests/accuracy.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.1065.0",
+    "@aws-sdk/credential-providers": "^3.1065.0",
     "@hono/node-server": "^2.0.3",
     "@hono/swagger-ui": "^0.6.1",
     "@napi-rs/canvas": "^1.0.0",
     "canvas": "^3.2.3",
     "hono": "^4.12.21",
-    "kordoc": "^2.9.0",
+    "kordoc": "^3.0.1",
     "mupdf": "^1.27.0",
     "pdfjs-dist": "^4.10.38"
   }

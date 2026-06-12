@@ -8,12 +8,14 @@ import { runConvert } from "./convert.js";
 import { resolveAiConfig } from "./ai.js";
 import { checkVllmConnection, vllmInfo, VLLM_ENABLED } from "./vllm.js";
 import { openapiSpec } from "./openapi.js";
+import { registerEvalRoutes } from "./eval.js";
 
 const PORT = Number(process.env.PORT || 8787);
 
 const app = new Hono();
 
 app.use("/api/*", cors({ origin: process.env.CORS_ORIGIN || "*" }));
+registerEvalRoutes(app);
 
 app.get("/api/health", (c) => c.json({ ok: true, kordoc: true, vllm: vllmInfo }));
 app.get("/api/vllm/check", async (c) => c.json(await checkVllmConnection()));
@@ -28,15 +30,20 @@ app.get("/api/docs", swaggerUI({ url: "/api/openapi.json", title: "fs.md API" })
 // POST /api/convert (multipart): file + provider(+provider 설정) → { ok, markdown, metadata, pageCount }.
 // provider/설정 상세는 openapi.js(/api/docs) 참고.
 app.post("/api/convert", async (c) => {
+  const startedAt = performance.now();
+  const elapsedMs = () => Math.round(performance.now() - startedAt);
   const parsed = await readMultipartFile(c);
-  if (parsed.error) return c.json({ ok: false, error: parsed.error }, 400);
+  if (parsed.error) return c.json({ ok: false, error: parsed.error, elapsedMs: elapsedMs() }, 400);
   const { arrayBuffer, filename, body } = parsed;
 
   let aiConfig;
   try {
     aiConfig = resolveAiConfig(body);
   } catch (e) {
-    return c.json({ ok: false, error: e?.message || String(e), code: e?.code || "BAD_PROVIDER" }, 400);
+    return c.json(
+      { ok: false, error: e?.message || String(e), code: e?.code || "BAD_PROVIDER", elapsedMs: elapsedMs() },
+      400
+    );
   }
 
   console.log(
@@ -45,10 +52,10 @@ app.post("/api/convert", async (c) => {
 
   try {
     const result = await runConvert(arrayBuffer, filename, {}, aiConfig);
-    return c.json({ ok: true, ...result });
+    return c.json({ ok: true, ...result, elapsedMs: elapsedMs() });
   } catch (e) {
     console.error("[convert] 실패:", e);
-    return c.json({ ok: false, error: e?.message || String(e), code: e?.code }, 500);
+    return c.json({ ok: false, error: e?.message || String(e), code: e?.code, elapsedMs: elapsedMs() }, 500);
   }
 });
 

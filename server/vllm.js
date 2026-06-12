@@ -70,12 +70,53 @@ export async function enrichMarkdown(
 
   let out = markdown;
   for (const ins of insertions) {
-    const oneLine = ins.text.replace(/\s+/g, " ").trim();
-    const block = `\n\n> ${oneLine}\n`;
-    out = out.slice(0, ins.at) + block + out.slice(ins.at);
+    out = out.slice(0, ins.at) + formatInsertion(ins.text) + out.slice(ins.at);
   }
 
   return { markdown: out, enriched, skipped, failed, total: targets.length };
+}
+
+// 분석 응답 → 삽입 블록. 응답에 표(markdown |…| / HTML <table>)가 있으면 표는 그대로
+// 살리고 산문 줄만 "> " 인용으로 감싼다. 표가 없으면 기존처럼 한 줄 인용.
+// (export 는 단위 테스트용)
+export function formatInsertion(text) {
+  const t = String(text || "").trim();
+  if (!t) return "";
+  if (!/^\s*\|.+\|/m.test(t) && !/<table[\s>]/i.test(t)) {
+    return `\n\n> ${t.replace(/\s+/g, " ")}\n`;
+  }
+  const blocks = [];
+  let prose = [];
+  let table = [];
+  let inHtmlTable = false;
+  const flushProse = () => {
+    const s = prose.join(" ").replace(/\s+/g, " ").trim();
+    if (s) blocks.push(`> ${s}`);
+    prose = [];
+  };
+  const flushTable = () => {
+    if (table.length) blocks.push(table.join("\n"));
+    table = [];
+  };
+  for (const raw of t.split("\n")) {
+    const line = raw.trim();
+    const opensHtml = /<table[\s>]/i.test(line);
+    if (inHtmlTable || opensHtml || line.startsWith("|")) {
+      flushProse();
+      table.push(raw.trimEnd());
+      if (opensHtml) inHtmlTable = true;
+      if (/<\/table>/i.test(line)) inHtmlTable = false;
+    } else if (!line) {
+      flushProse();
+      flushTable();
+    } else {
+      flushTable();
+      prose.push(line);
+    }
+  }
+  flushProse();
+  flushTable();
+  return `\n\n${blocks.join("\n\n")}\n`;
 }
 
 function empty(markdown) {
@@ -168,23 +209,45 @@ async function analyzeTarget(t, imageMap) {
   return null;
 }
 
+// 추출(OCR) 호출용 샘플링 — vLLM 서버 기본값이 채팅용(temp 0.6, presence 1.1)이라
+// 표·반복 텍스트 전사를 망치므로 명시적으로 고정한다. 분석/요약 호출에는 적용하지 않는다.
+const OCR_SAMPLING = Object.freeze({
+  temperature: 0.1,
+  topP: 1.0,
+  presencePenalty: 0,
+  repetitionPenalty: 1.0,
+});
+
+// 페이지 OCR 본체 — 실패 시 throw (호출부에서 스케일 재시도 등 판단).
+// 공통 지시문은 system 으로(byte 동일 → prefix cache), 페이지 번호 등 가변값은 user 로.
+async function vllmOcrPageStrict(pageImage, pageNumber, mimeType = "image/png") {
+  const b64 = Buffer.from(pageImage).toString("base64");
+  const url = `data:${mimeType};base64,${b64}`;
+  const text = await aiCall({
+    image: url,
+    system: prompts.pdfOcrSystem,
+    prompt: prompts.pdfOcrUser(pageNumber),
+    maxTokens: cfg.tokens.ocr,
+    ...OCR_SAMPLING,
+    timeoutMs: cfg.timeouts.ocrMs,
+  });
+  return cleanOcrText(text);
+}
+
 // kordoc OcrProvider: 텍스트 레이어 없는 PDF 페이지(PNG) → vision OCR → markdown.
+// (배치 안전용 — 실패를 삼키고 "" 반환. 페이지 하나 실패가 문서 전체를 죽이지 않게.)
 export async function vllmOcrPage(pageImage, pageNumber, mimeType = "image/png") {
   try {
-    const b64 = Buffer.from(pageImage).toString("base64");
-    const url = `data:${mimeType};base64,${b64}`;
-    const text = await aiCall({
-      image: url,
-      prompt: prompts.pdfOcrPage(pageNumber),
-      maxTokens: cfg.tokens.ocr,
-      temperature: 0.0,
-      timeoutMs: cfg.timeouts.ocrMs,
-    });
-    return cleanOcrText(text);
+    return await vllmOcrPageStrict(pageImage, pageNumber, mimeType);
   } catch (e) {
     console.warn(`[vllm-ocr] page ${pageNumber} failed:`, e?.message || e);
     return "";
   }
+}
+
+// vLLM 컨텍스트(이미지 토큰) 초과 — 같은 이미지를 다시 보내도 실패하므로 스케일을 낮춰야 한다.
+function isContextOverflow(e) {
+  return e?.status === 400 && /context|token|length|too large/i.test(e?.message || "");
 }
 
 // 업로드된 이미지 1장 → AI vision OCR → markdown. (배치와 달리 실패 시 throw)
@@ -192,9 +255,10 @@ export async function ocrImageBuffer(arrayBuffer, mimeType = "image/png") {
   const url = await toSafeImageUrl(arrayBuffer, mimeType);
   const text = await aiCall({
     image: url,
-    prompt: prompts.imageOcr,
+    system: prompts.imageOcrSystem,
+    prompt: prompts.imageOcrUser,
     maxTokens: cfg.tokens.ocr,
-    temperature: 0.0,
+    ...OCR_SAMPLING,
     timeoutMs: cfg.timeouts.ocrMs,
   });
   return cleanOcrText(text);
@@ -346,44 +410,81 @@ async function mapWithLimit(items, limit, worker) {
   await Promise.all(runners);
 }
 
-// PDF 페이지 렌더. pdfjs-dist+canvas 는 이 환경에서 깨져 mupdf 사용. pageFilter=null 이면 전체.
-async function renderPdfPages(arrayBuffer, pageFilter = null, scale = cfg.render.ocrScale) {
+// PDF 렌더 핸들 (lazy). pdfjs-dist+canvas 는 이 환경에서 깨져 mupdf 사용.
+// 페이지를 미리 전부 렌더하지 않고 worker 가 필요할 때 한 장씩 렌더한다(대형 스캔본 메모리 스파이크 방지).
+// scaleFactor 는 컨텍스트 초과 시 재시도용 축소 배율(1 = 기본).
+async function openPdfRenderer(arrayBuffer) {
   const mupdf = await import("mupdf");
   const doc = mupdf.Document.openDocument(new Uint8Array(arrayBuffer), "application/pdf");
   const pageCount = doc.countPages();
-  const pages = [];
-  for (let i = 1; i <= pageCount; i++) {
-    if (pageFilter && !pageFilter.has(i)) continue;
-    try {
-      const page = doc.loadPage(i - 1);
+  return {
+    pageCount,
+    renderPage(pageNum, scaleFactor = 1) {
+      const page = doc.loadPage(pageNum - 1);
+      // 페이지 크기에 맞춰 유효 스케일 산출: 긴 변이 ocrMaxLongSidePx 를 넘지 않게 자동 축소.
+      let w = 0, h = 0;
+      try {
+        const b = page.getBounds();
+        const a = Array.isArray(b) ? b : [b.x0, b.y0, b.x1, b.y1];
+        w = a[2] - a[0];
+        h = a[3] - a[1];
+      } catch { /* bounds 실패 시 기본 스케일 사용 */ }
+      const longSide = Math.max(w, h);
+      const capped = longSide > 0
+        ? Math.min(cfg.render.ocrScale, cfg.render.ocrMaxLongSidePx / longSide)
+        : cfg.render.ocrScale;
+      const scale = Math.max(0.5, capped * scaleFactor);
       const pix = page.toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceRGB);
-      pages.push({ page: i, png: Buffer.from(pix.asPNG()) });
-    } catch (e) {
-      console.warn(`[render] page ${i} failed:`, e?.message || e);
-    }
-  }
-  return { pageCount, pages };
+      return Buffer.from(pix.asPNG());
+    },
+  };
 }
 
-// 스캔본(IMAGE_BASED_PDF) fallback: 전 페이지 렌더 → vllmOcrPage → markdown 합성.
+// 렌더 → OCR 1页. 컨텍스트 초과(400)면 0.7배로 줄여 1회 재시도. 그 외 실패는 "" (페이지 단위 격리).
+async function ocrPageAdaptive(renderer, pageNum) {
+  for (const factor of [1, 0.7]) {
+    let png;
+    try {
+      png = renderer.renderPage(pageNum, factor);
+    } catch (e) {
+      console.warn(`[render] page ${pageNum} failed:`, e?.message || e);
+      return "";
+    }
+    try {
+      return await vllmOcrPageStrict(png, pageNum, "image/png");
+    } catch (e) {
+      if (factor === 1 && isContextOverflow(e)) {
+        console.warn(`[vllm-ocr] page ${pageNum} 컨텍스트 초과 — 0.7배 축소 재시도`);
+        continue;
+      }
+      console.warn(`[vllm-ocr] page ${pageNum} failed:`, e?.message || e);
+      return "";
+    }
+  }
+  return "";
+}
+
+// 스캔본(IMAGE_BASED_PDF) fallback: 전 페이지 lazy 렌더 → OCR → markdown 합성.
 export async function ocrPdfBuffer(arrayBuffer, { onProgress, onPage } = {}) {
-  const { pageCount, pages } = await renderPdfPages(arrayBuffer, null);
-  const texts = new Array(pages.length).fill("");
+  const renderer = await openPdfRenderer(arrayBuffer);
+  const pageCount = renderer.pageCount;
+  const pageNums = Array.from({ length: pageCount }, (_, i) => i + 1);
+  const texts = new Array(pageCount).fill("");
   let okCount = 0;
   let done = 0;
 
-  await mapWithLimit(pages, cfg.concurrency.ocr, async ({ page, png }, idx) => {
+  await mapWithLimit(pageNums, cfg.concurrency.ocr, async (page, idx) => {
     onPage?.(page, pageCount);
-    const clean = (await vllmOcrPage(png, page, "image/png")).trim();
+    const clean = (await ocrPageAdaptive(renderer, page)).trim();
     if (clean) {
       texts[idx] = clean;
       okCount++;
     }
-    onProgress?.(++done / (pages.length || 1));
+    onProgress?.(++done / (pageCount || 1));
   });
 
-  const sections = pages
-    .map(({ page }, idx) =>
+  const sections = pageNums
+    .map((page, idx) =>
       texts[idx] ? (pageCount > 1 ? `## 페이지 ${page}\n\n${texts[idx]}` : texts[idx]) : null
     )
     .filter(Boolean);
@@ -401,7 +502,31 @@ function median(nums) {
   return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
 }
 
-export async function detectSpreadPages(arrayBuffer) {
+// 페이지별 블록 분포(중앙 접지선 48~52% 기준) — 펼침면/단일 가로 페이지 판별 증거.
+// 진짜 펼침면: 좌우가 독립 레이아웃 → 횡단 비율이 낮고(≤0.35) 양쪽 모두에 블록이 있다.
+// A4 가로 단일(공고문 등): 전폭 표/문단이 많아 횡단 비율 0.7+, 혹은 콘텐츠가 한쪽에 쏠림.
+function spreadEvidence(blocks, dims) {
+  const widthByPage = new Map(dims.map((d) => [d.page, d.w]));
+  const stats = new Map(); // page -> { total, cross, left, right, fullWidth }
+  for (const b of blocks || []) {
+    if (!b.pageNumber || !b.bbox) continue;
+    const W = widthByPage.get(b.pageNumber);
+    if (!W) continue;
+    const row = stats.get(b.pageNumber) || { total: 0, cross: 0, left: 0, right: 0, fullWidth: 0 };
+    row.total++;
+    const x0 = b.bbox.x, x1 = b.bbox.x + b.bbox.width;
+    if (x0 < W * 0.48 && x1 > W * 0.52) row.cross++;
+    else if (x1 <= W * 0.52) row.left++;
+    else row.right++;
+    // 페이지 폭의 10%~90% 를 가로지르는 전폭 블록 — 진짜 펼침면에는 물리적으로 불가능
+    // (두 물리 페이지에 걸친 표/문단은 없음). 단일 가로 페이지의 결정적 증거.
+    if (x0 < W * 0.1 && x1 > W * 0.9) row.fullWidth++;
+    stats.set(b.pageNumber, row);
+  }
+  return stats;
+}
+
+export async function detectSpreadPages(arrayBuffer, blocks = null) {
   const empty = { spreadPages: new Set(), pageCount: 0, portraitW: 0, dims: [] };
   if (!cfg.features.spreadSplit) return empty;
   let doc;
@@ -425,12 +550,24 @@ export async function detectSpreadPages(arrayBuffer) {
     dims.push({ page: i + 1, w, h });
   }
   const portraitW = median(dims.filter((d) => d.w > 0 && d.w <= d.h * 1.05).map((d) => d.w));
+  // 세로 기준 페이지가 없을 때(전부 가로형): A4 가로 단일(비율 1.41)과 A4 세로 2쪽
+  // 펼침면(비율 1.41)은 기하만으로 구분 불가 → 블록 증거가 펼침면을 지지할 때만 인정.
+  // 오탐(단일 가로 공고문을 반 가르기)이 미탐보다 훨씬 치명적이므로 보수적으로 판단한다.
+  const evidence = portraitW ? null : spreadEvidence(blocks, dims);
   const spreadPages = new Set();
   for (const d of dims) {
     if (!(d.w > 0 && d.h > 0) || d.w <= d.h * 1.15) continue; // landscape 만 후보
-    const isSpread = portraitW
-      ? d.w / portraitW >= 1.6 && d.w / portraitW <= 2.4 // ≈ 세로폭 2배 = 두 쪽
-      : d.w / d.h >= 1.25 && d.w / d.h <= 1.6; // 기준 없으면 A-계열 2-up 비율
+    let isSpread;
+    if (portraitW) {
+      isSpread = d.w / portraitW >= 1.6 && d.w / portraitW <= 2.4; // ≈ 세로폭 2배 = 두 쪽
+    } else {
+      const ev = evidence?.get(d.page);
+      isSpread =
+        d.w / d.h >= 1.25 && d.w / d.h <= 1.6 // A-계열 2-up 비율
+        && !!ev && ev.cross / ev.total <= 0.35 // 중앙 횡단 블록이 적고
+        && ev.left >= 1 && ev.right >= 1 // 좌우 양쪽에 독립 콘텐츠가 있고
+        && ev.fullWidth === 0; // 전폭 블록이 하나라도 있으면 단일 가로 페이지
+    }
     if (isSpread) spreadPages.add(d.page);
   }
   return { spreadPages, pageCount, portraitW, dims };
@@ -449,41 +586,56 @@ async function splitPngHalves(png) {
 }
 
 export async function ocrSelectedPdfPages(arrayBuffer, pageNumbers, { onPage, spreadPages } = {}) {
-  const want = new Set((pageNumbers || []).filter((n) => n > 0));
-  if (!want.size) return new Map();
+  const want = [...new Set((pageNumbers || []).filter((n) => n > 0))].sort((a, b) => a - b);
+  if (!want.length) return new Map();
   const spreads = spreadPages instanceof Set ? spreadPages : new Set(spreadPages || []);
-  const { pages } = await renderPdfPages(arrayBuffer, want);
+  const renderer = await openPdfRenderer(arrayBuffer);
+  const totalUnits = want.reduce((s, p) => s + (spreads.has(p) ? 2 : 1), 0);
 
-  const units = [];
-  for (const { page, png } of pages) {
-    if (spreads.has(page)) {
-      try {
-        const [left, right] = await splitPngHalves(png);
-        units.push({ page, half: 0, png: left });
-        units.push({ page, half: 1, png: right });
-        continue;
-      } catch (e) {
-        console.warn(`[spread] page ${page} split 실패 → 통짜 OCR:`, e?.message || e);
-      }
-    }
-    units.push({ page, half: 0, png });
-  }
-
-  const partial = new Map(); // page -> { 0: leftText, 1: rightText }
+  const texts = new Map(); // page -> merged markdown
   let done = 0;
-  await mapWithLimit(units, cfg.concurrency.ocr, async (u) => {
-    const text = (await vllmOcrPage(u.png, u.page, "image/png")).trim();
-    onPage?.(++done, units.length, u.page);
-    if (!partial.has(u.page)) partial.set(u.page, {});
-    partial.get(u.page)[u.half] = text;
-  });
+  await mapWithLimit(want, cfg.concurrency.ocr, async (page) => {
+    // 일반 페이지(또는 분할 실패 fallback): 통짜 OCR.
+    const wholePage = async () => {
+      const t = (await ocrPageAdaptive(renderer, page)).trim();
+      onPage?.(++done, totalUnits, page);
+      if (t) texts.set(page, t);
+    };
 
-  const texts = new Map();
-  for (const { page } of pages) {
-    if (texts.has(page)) continue;
-    const ph = partial.get(page) || {};
-    const merged = [ph[0], ph[1]].filter(Boolean).map((s) => s.trim()).join("\n\n");
+    if (!spreads.has(page)) return wholePage();
+
+    // 펼침면: 한 번 렌더해 반으로 가르고 좌→우 순차 OCR (전역 동시성 한도 준수).
+    let halves = null;
+    try {
+      halves = await splitPngHalves(renderer.renderPage(page));
+    } catch (e) {
+      console.warn(`[spread] page ${page} split 실패 → 통짜 OCR:`, e?.message || e);
+    }
+    if (!halves) return wholePage();
+
+    const parts = [];
+    for (let h = 0; h < 2; h++) {
+      let text = "";
+      try {
+        text = await vllmOcrPageStrict(halves[h], page, "image/png");
+      } catch (e) {
+        if (isContextOverflow(e)) {
+          console.warn(`[vllm-ocr] page ${page} half ${h} 컨텍스트 초과 — 0.7배 축소 재시도`);
+          try {
+            const smaller = await splitPngHalves(renderer.renderPage(page, 0.7));
+            text = await vllmOcrPageStrict(smaller[h], page, "image/png");
+          } catch (e2) {
+            console.warn(`[vllm-ocr] page ${page} half ${h} failed:`, e2?.message || e2);
+          }
+        } else {
+          console.warn(`[vllm-ocr] page ${page} half ${h} failed:`, e?.message || e);
+        }
+      }
+      parts.push(String(text || "").trim());
+      onPage?.(++done, totalUnits, page);
+    }
+    const merged = parts.filter(Boolean).join("\n\n");
     if (merged) texts.set(page, merged);
-  }
+  });
   return texts;
 }

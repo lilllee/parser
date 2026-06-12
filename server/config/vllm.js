@@ -18,6 +18,7 @@ export const vllmConfig = Object.freeze({
     },
     render: {
       ocrScale: Number(process.env.VLLM_OCR_RENDER_SCALE || 2),
+      ocrMaxLongSidePx: Number(process.env.VLLM_OCR_MAX_LONG_SIDE || 2200),
     },
     features: {
       pageVisual: process.env.VLLM_PAGE_VISUAL !== "0",

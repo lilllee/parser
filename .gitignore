@@ -44,3 +44,4 @@ coverage/
 *.tgz
 tests/_out_*.json
 tests/_smoke*
+tests/_eval/
