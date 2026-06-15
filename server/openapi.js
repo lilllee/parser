@@ -137,6 +137,12 @@ export const openapiSpec = {
             default: VLLM_THINKING_DEFAULT,
             description: "[vllm] 모델 thinking 모드. 이 모델군은 켜면 응답이 비거나 잘릴 수 있어 기본 false 권장.",
           },
+          format: {
+            type: "string",
+            enum: ["md", "html"],
+            default: "md",
+            description: "출력 표 포맷. md(기본): 사람/RAG 가독용 markdown 파이프 표. html: <table> 구조 보존(병합셀·ParseBench GRITS 등 HTML 표만 인식하는 소비처용).",
+          },
           api_key: {
             type: "string",
             description: "[openai / anthropic / gemini] API 키.",
