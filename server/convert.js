@@ -125,7 +125,10 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
   // 망가진/펼침면 페이지만 골라 vision OCR 로 재추출해 교체 (reflow).
   let reflowInfo = null;
   if (enabled && !ocrInfo && result.fileType === "pdf" && (result.blocks || []).length) {
-    const mangled = detectMangledPages(result.blocks, result.pageCount || 0);
+    // kordoc 는 PDF 페이지 수를 metadata.pageCount 에 넣으므로 fallback — 안 하면 0 이 전달돼
+    // detectLowDensityPages(블록 0개인 빈 페이지 감지)가 무력화된다.
+    const pageCount = result.pageCount ?? result.metadata?.pageCount ?? 0;
+    const mangled = detectMangledPages(result.blocks, pageCount);
     const qualityOcr = (result.pageQuality || []).filter((q) => q.needsOcr).map((q) => q.page);
     if (qualityOcr.length) {
       console.log(`[quality] kordoc needsOcr 페이지: ${qualityOcr.join(",")}`);
@@ -208,29 +211,34 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
   };
 }
 
-// reflow 된 페이지의 블록들을 OCR 텍스트 블록들로 치환(순서·union bbox 유지).
-function reflowBlocksWithOcr(blocks, texts) {
+// reflow 된 페이지를 OCR 텍스트 블록으로 치환(순서·union bbox 유지).
+// kordoc 가 블록 0개로 떤 페이지(빈 페이지)라도 OCR 결과가 있으면 올바른 페이지 순서 위치에
+// 삽입한다 — 예전엔 원본 블록만 순회해 교체했기에, 교체할 원본 블록이 없는 빈 페이지의 OCR
+// 텍스트가 통째로 누락됐다. (export 는 단위 테스트용)
+export function reflowBlocksWithOcr(blocks, texts) {
+  // 페이지별 원본 블록 그룹(원본 순서 유지) + OCR 대상 페이지의 bbox 합집합.
+  const byPage = new Map();
   const bboxByPage = new Map();
   for (const b of blocks) {
-    if (!texts.has(b.pageNumber) || !b.bbox) continue;
-    bboxByPage.set(b.pageNumber, unionBbox(bboxByPage.get(b.pageNumber), b.bbox));
-  }
-  const out = [];
-  const emitted = new Set();
-  for (const b of blocks) {
-    const pn = b.pageNumber;
-    if (texts.has(pn)) {
-      if (!emitted.has(pn)) {
-        const bbox = bboxByPage.get(pn);
-        const chunks = String(texts.get(pn)).split(/\n{2,}/).map((t) => t.trim()).filter(Boolean);
-        for (const chunk of chunks.length ? chunks : [texts.get(pn)]) {
-          out.push({ type: "paragraph", text: chunk, pageNumber: pn, bbox });
-        }
-        emitted.add(pn);
-      }
-      continue;
+    if (!byPage.has(b.pageNumber)) byPage.set(b.pageNumber, []);
+    byPage.get(b.pageNumber).push(b);
+    if (texts.has(b.pageNumber) && b.bbox) {
+      bboxByPage.set(b.pageNumber, unionBbox(bboxByPage.get(b.pageNumber), b.bbox));
     }
-    out.push(b);
+  }
+  // 출력 페이지 순서 = (원본 블록 페이지 ∪ OCR 페이지) 오름차순 — 빈 페이지의 OCR 도 포함.
+  const pages = [...new Set([...byPage.keys(), ...texts.keys()])].sort((a, b) => a - b);
+  const out = [];
+  for (const pn of pages) {
+    if (texts.has(pn)) {
+      const bbox = bboxByPage.get(pn);
+      const chunks = String(texts.get(pn)).split(/\n{2,}/).map((t) => t.trim()).filter(Boolean);
+      for (const chunk of chunks.length ? chunks : [texts.get(pn)]) {
+        out.push({ type: "paragraph", text: chunk, pageNumber: pn, bbox });
+      }
+    } else {
+      out.push(...byPage.get(pn));
+    }
   }
   return out;
 }
