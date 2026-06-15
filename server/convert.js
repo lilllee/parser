@@ -10,6 +10,7 @@ import {
 import { resolveAiConfig, withAiConfig, aiEnabled } from "./ai.js";
 import { detectMangledPages } from "./detect.js";
 import { postprocessMarkdown } from "./postprocess.js";
+import { collectInvisibleText, stripInvisibleFromBlocks } from "./invisible.js";
 
 export async function runConvert(arrayBuffer, filename, sink = {}, aiConfig = resolveAiConfig()) {
   // 요청별 AI 설정을 컨텍스트에 깔아 내부 aiComplete 들이 같은 provider 를 쓰게 한다(ALS).
@@ -101,6 +102,24 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
 
   for (const w of result.warnings || []) {
     onWarning({ message: w.message || String(w), code: w.code });
+  }
+
+  // 보이지 않는 텍스트(흰 배경 흰 글자 등 — kordoc 이 텍스트 레이어에서 그대로 떠온 것) 제거.
+  // mangled 감지/재추출보다 먼저 해서 정리된 블록이 이후 단계에 흐르게 한다.
+  if (result.fileType === "pdf" && (result.blocks || []).length) {
+    try {
+      const invis = collectInvisibleText(rawBackup.slice(0));
+      if (invis.size) {
+        const { blocks, removed } = stripInvisibleFromBlocks(result.blocks, invis);
+        if (removed) {
+          result.blocks = blocks;
+          result.markdown = blocksToMarkdown(result.blocks);
+          console.log(`[invisible] ${filename} · 숨은 텍스트 ${removed}블록 정리`);
+        }
+      }
+    } catch (e) {
+      console.warn("[invisible] failed:", e?.message || e);
+    }
   }
 
   // 망가진/펼침면 페이지만 골라 vision OCR 로 재추출해 교체 (reflow).
