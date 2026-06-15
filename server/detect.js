@@ -76,6 +76,73 @@ export function isPercentCramTable(table) {
   });
 }
 
+// 좌우 컬럼이 거의 같은 비교표(현행/개정·전/후 등). kordoc 은 이런 3단(쪽|현행|개정) 표를
+// 2단으로 뭉개고 행을 잘게 쪼개 페이지번호를 본문 셀에 섞어 신뢰도가 낮다. 한 행에서(공백
+// 제거 후) minCellLen 자 이상인 두 셀이 같거나 한쪽이 다른 쪽을 포함하면 '중복 행'으로 보고,
+// 비교 가능한 행의 절반 이상이 중복이면 비교표로 판정. (정상 표는 열마다 값이 달라 안 걸림)
+export function isDuplicateColumnTable(table) {
+  if (!table?.cells || (table.cols || 0) < 2) return false;
+  let dup = 0, comparable = 0;
+  for (const row of table.cells) {
+    const texts = (row || [])
+      .map((c) => (c?.text || "").replace(/\s+/g, ""))
+      .filter((t) => t.length >= cfg.dupColumnTable.minCellLen);
+    if (texts.length < 2) continue;
+    comparable++;
+    let found = false;
+    for (let i = 0; i < texts.length && !found; i++) {
+      for (let j = i + 1; j < texts.length && !found; j++) {
+        if (texts[i] === texts[j] || texts[i].includes(texts[j]) || texts[j].includes(texts[i])) found = true;
+      }
+    }
+    if (found) dup++;
+  }
+  return comparable >= cfg.dupColumnTable.minRows && dup / comparable >= cfg.dupColumnTable.dupRatio;
+}
+
+// 한 셀에 여러 줄(문단/구간)이 통째로 뭉친 표 — kordoc 이 칸 구조를 잃고 본문을 셀 하나에
+// 욱여넣은 신호(비대칭 비교표·복잡 레이아웃에서 흔함). 정상 데이터표 셀은 길어도 줄바꿈이
+// 거의 없으므로 '셀 안 줄수'로 판정(글자수가 아니라 — 통계표엔 줄바꿈 없는 긴 셀이 정상).
+export function isCrammedCellTable(table) {
+  if (!table?.cells || (table.cols || 0) > cfg.crammedCell.maxCols) return false;
+  for (const row of table.cells) {
+    for (const c of row || []) {
+      const t = (c?.text || "").trim();
+      if (t && (t.match(/\n/g) || []).length + 1 >= cfg.crammedCell.minLines) return true;
+    }
+  }
+  return false;
+}
+
+// 개정 대비표(현행/개정 비교) 페이지. 좌우 2단 비교 레이아웃은 내용이 비대칭(한쪽 빈칸/삽입)
+// 이면 isDuplicateColumnTable 로 안 잡히지만, '현행'·'개정' 머리글은 페이지마다 반복되므로
+// 이를 신호로 페이지 단위 vision 재추출. 본문 우연 동시등장 오탐을 줄이려 짧은 블록 또는 표
+// 머리글 행 셀에서만 마커를 인정한다.
+export function detectRevisionComparisonPages(blocks) {
+  const byPage = new Map(); // page -> { hyun, gae }
+  const mark = (pn, key) => {
+    const e = byPage.get(pn) || { hyun: false, gae: false };
+    e[key] = true;
+    byPage.set(pn, e);
+  };
+  const scan = (pn, t) => {
+    if (!t) return;
+    if (/현\s*행/.test(t)) mark(pn, "hyun");
+    if (/개\s*정/.test(t)) mark(pn, "gae");
+  };
+  for (const b of blocks || []) {
+    if (!b.pageNumber) continue;
+    if (b.type === "table") {
+      for (const c of b.table?.cells?.[0] || []) scan(b.pageNumber, c?.text); // 머리글 행
+    } else if ((b.text || "").length <= cfg.revisionTable.maxMarkerLen) {
+      scan(b.pageNumber, b.text);
+    }
+  }
+  const pages = new Set();
+  for (const [pn, e] of byPage) if (e.hyun && e.gae) pages.add(pn);
+  return pages;
+}
+
 // 블록의 텍스트 글자수 (표는 셀 텍스트 합산).
 function blockChars(b) {
   if (b.text) return b.text.length;
@@ -107,13 +174,29 @@ export function detectLowDensityPages(blocks, pageCount = 0) {
   return pages;
 }
 
+// 차트/표가 단락으로 흩어져 '숫자만 있는 블록'이 한 페이지에 여럿(임계 이상) — kordoc 이
+// 표/차트 구조를 잃고 값을 개별 단락으로 흩뿌린 신호(정수 라벨 차트가 대표). 정상 표는
+// 값이 셀(table 블록) 안에 있으므로 여기 안 걸린다.
+export function detectScatteredNumberPages(blocks) {
+  const byPage = new Map();
+  for (const b of blocks || []) {
+    if (!b.pageNumber || b.type === "table") continue;
+    if (/^\s*-?\d{1,4}\s*$/.test(b.text || "")) {
+      byPage.set(b.pageNumber, (byPage.get(b.pageNumber) || 0) + 1);
+    }
+  }
+  const pages = new Set();
+  for (const [pn, c] of byPage) if (c >= cfg.scatteredNumbers.minLoneBlocks) pages.add(pn);
+  return pages;
+}
+
 // 망가진 페이지 번호(1-based) 오름차순, 중복 제거. pageCount 를 주면 저밀도 신호도 포함.
 export function detectMangledPages(blocks, pageCount = 0) {
   const pages = new Set();
   const glyphByPage = new Map();
   for (const b of blocks || []) {
     if (!b.pageNumber) continue;
-    if (b.type === "table" && (isProseFakeTable(b.table) || isGarbledDataTable(b.table) || isPercentCramTable(b.table))) {
+    if (b.type === "table" && (isProseFakeTable(b.table) || isGarbledDataTable(b.table) || isPercentCramTable(b.table) || isDuplicateColumnTable(b.table) || isCrammedCellTable(b.table))) {
       pages.add(b.pageNumber);
     } else if (isPipeTableParagraph(b) || hasBrokenKoreanSpacing(b)) {
       pages.add(b.pageNumber);
@@ -123,6 +206,8 @@ export function detectMangledPages(blocks, pageCount = 0) {
     if (g) glyphByPage.set(b.pageNumber, (glyphByPage.get(b.pageNumber) || 0) + g);
   }
   for (const [pn, count] of glyphByPage) if (count >= cfg.glyphNoise.pageThreshold) pages.add(pn);
+  for (const pn of detectScatteredNumberPages(blocks)) pages.add(pn);
+  for (const pn of detectRevisionComparisonPages(blocks)) pages.add(pn);
   if (pageCount > 0) for (const pn of detectLowDensityPages(blocks, pageCount)) pages.add(pn);
   return [...pages].sort((a, b) => a - b);
 }
