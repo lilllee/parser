@@ -209,13 +209,18 @@ async function analyzeTarget(t, imageMap) {
   return null;
 }
 
-// 추출(OCR) 호출용 샘플링 — vLLM 서버 기본값이 채팅용(temp 0.6, presence 1.1)이라
-// 표·반복 텍스트 전사를 망치므로 명시적으로 고정한다. 분석/요약 호출에는 적용하지 않는다.
+// 추출(OCR) 호출용 샘플링. 전사 충실도를 위해 저온(temp 0.1)을 쓴다 — 낮을수록 결정적이라
+// 같은 토큰(<br>·개행)을 무한 반복하는 degeneration 위험이 있지만, 이는 repetition_penalty(등장
+// 토큰에 '일정' 페널티)가 막는다 — temp 0.1 + rep 1.1 조합은 degeneration 없음을 실측 확인.
+// rep 은 횟수 비례가 아니라, 현행/개정처럼 내용이 길게 반복되는 비교 문서에서 단어 치환
+// 드리프트를 일으키지 않는다. (frequency_penalty 는 횟수 비례라 반복 문서에서 드리프트 →
+// 기본 0. presence_penalty 도 전사 충실도 저해 우려로 0.) 모두 env 로 모델별 튜닝 가능.
 const OCR_SAMPLING = Object.freeze({
-  temperature: 0.1,
-  topP: 1.0,
-  presencePenalty: 0,
-  repetitionPenalty: 1.0,
+  temperature: Number(process.env.VLLM_OCR_TEMPERATURE ?? 0.1),
+  topP: Number(process.env.VLLM_OCR_TOP_P ?? 1.0),
+  presencePenalty: Number(process.env.VLLM_OCR_PRESENCE_PENALTY ?? 0),
+  repetitionPenalty: Number(process.env.VLLM_OCR_REPETITION_PENALTY ?? 1.1),
+  frequencyPenalty: Number(process.env.VLLM_OCR_FREQUENCY_PENALTY ?? 0),
 });
 
 // 페이지 OCR 본체 — 실패 시 throw (호출부에서 스케일 재시도 등 판단).

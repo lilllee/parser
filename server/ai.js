@@ -69,6 +69,7 @@ export async function aiComplete({
   topP,
   presencePenalty,
   repetitionPenalty,
+  frequencyPenalty,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 }) {
   const ai = currentAiConfig();
@@ -102,6 +103,7 @@ export async function aiComplete({
         topP,
         presencePenalty,
         repetitionPenalty,
+        frequencyPenalty,
       });
       const json = await fetchJson(req, timeoutMs);
       if (isTruncated(json)) {

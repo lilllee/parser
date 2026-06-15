@@ -12,8 +12,9 @@ function openaiChatParse(json) {
 
 // 로컬 vLLM (OpenAI 호환). thinking 켜면 사고 토큰이 답을 다 먹어 비므로 기본 OFF.
 // system 메시지 지원: OCR 공통 지시문을 byte 동일하게 맨 앞에 보내 prefix cache 를 살린다.
-// 샘플링 파라미터(topP 등)는 명시된 것만 body 에 포함 — 서버 기본값(채팅용 0.6/1.1)이
-// 표·반복 텍스트 전사에 부적합해 추출 호출에서 명시적으로 덮어쓴다.
+// 샘플링 파라미터(topP 등)는 명시된 것만 body 에 포함 — 명시한 값은 서버의
+// override-generation-config 기본값을 덮어쓴다. (OCR 은 frequency_penalty 등으로 반복
+// 붕괴를 막으면서 표의 정상 반복은 허용 — OCR_SAMPLING in vllm.js 참고.)
 const vllmProvider = {
   id: "vllm",
   fields: ["url", "model", "thinking"],
@@ -25,7 +26,7 @@ const vllmProvider = {
   }),
   enabled: (cfg) => !!cfg.url && process.env.VLLM_DISABLED !== "1",
   info: (cfg) => ({ url: cfg.url, model: cfg.model, thinking: !!cfg.thinking }),
-  build(cfg, { system, prompt, text, image, maxTokens, temperature, topP, presencePenalty, repetitionPenalty }) {
+  build(cfg, { system, prompt, text, image, maxTokens, temperature, topP, presencePenalty, repetitionPenalty, frequencyPenalty }) {
     const content = [{ type: "text", text: prompt }];
     if (text) content.push({ type: "text", text });
     if (image) content.push({ type: "image_url", image_url: { url: image } });
@@ -42,6 +43,7 @@ const vllmProvider = {
     if (topP != null) body.top_p = topP;
     if (presencePenalty != null) body.presence_penalty = presencePenalty;
     if (repetitionPenalty != null) body.repetition_penalty = repetitionPenalty;
+    if (frequencyPenalty != null) body.frequency_penalty = frequencyPenalty;
     return {
       url: cfg.url,
       headers: { "Content-Type": "application/json" },
