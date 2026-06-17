@@ -46,7 +46,66 @@ export function scoreMarkdown(md) {
     issues.brokenKoreanSpacing + issues.crammedTableRows + issues.codeFences +
     issues.strayPageNums + issues.emptyMarkers + issues.bodyAsHeading;
 
-  return { chars: md.length, lines: lines.length, figures: figIdx.length, chartCoverage, issues, problemTotal };
+  // 청크 경계 완전성 — 변환 결함(problemTotal)과 별개의 정보성 신호라 따로 둔다.
+  const boundary = detectBoundaryIssues(md).flags;
+
+  return { chars: md.length, lines: lines.length, figures: figIdx.length, chartCoverage, issues, problemTotal, boundary };
+}
+
+// 청크 경계 완전성 검사 — 원문이 중간(조사/표/조문 미완)에서 잘렸는지 결정론적으로 감지한다.
+// 변환 실패는 아니지만 RAG 청크 품질에 중요한 신호라 경고로 표면화한다. (pipeline.md 2.1 참고)
+// 반환: { flags: {0|1}, warnings: [{code, message}] }. scoreMarkdown 은 flags 를, convert 는 warnings 를 쓴다.
+const JOSA_TAIL_RE = /(?:을|를|이|가|은|는|와|과|의|에|에서|에게|으로|로|및|또는|이나|거나|하고|하며|하여|부터|까지|보다|라며|라고|면서|지만|는데|으며|며)$/;
+const OPEN_BRACKET_RE = /[([{（［｛「『]$/;
+const LIST_MARKER_RE = /[①-⑮㉠-㉭]|(?:^|\s)\d+\s*\.|(?:^|\s)[가-하]\s*\.|(?:^|\n)\s*[-*]\s/;
+
+export function detectBoundaryIssues(md, filename = "") {
+  const text = String(md || "");
+  const flags = { danglingSentence: 0, unclosedTable: 0, statuteCutoff: 0, pageRangeChunk: 0 };
+  const warnings = [];
+
+  // 마지막 비어있지 않은 줄(장식 기호 꼬리는 떼고 본문 끝 글자로 판정).
+  const lines = text.split("\n");
+  let last = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].replace(/[ \t>#*`~_]+$/g, "").trim();
+    if (t) { last = t; break; }
+  }
+
+  // (a) 문장 미완 — 마지막 줄이 조사/접속어미·쉼표·콜론·열린 괄호로 끝남(표 구분행 제외).
+  const isSep = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(last);
+  if (last && !isSep && (JOSA_TAIL_RE.test(last) || /[,;:·،]$/.test(last) || OPEN_BRACKET_RE.test(last))) {
+    flags.danglingSentence = 1;
+    warnings.push({ code: "INCOMPLETE_TAIL", message: `문서가 문장 중간에서 끝남(말미: "${last.slice(-24)}") — 청크 경계에서 잘렸을 수 있음` });
+  }
+
+  // (b) 표 미완 — HTML <table> 개폐 불일치(표가 문서 끝에서 잘림).
+  const opens = (text.match(/<table\b/gi) || []).length;
+  const closes = (text.match(/<\/table\s*>/gi) || []).length;
+  if (opens !== closes) {
+    flags.unclosedTable = 1;
+    warnings.push({ code: "UNCLOSED_TABLE", message: `HTML <table> 가 닫히지 않음(open ${opens} / close ${closes}) — 표가 문서 끝에서 잘렸을 수 있음` });
+  }
+
+  // (c) 조문 미완 — '다음 각 호/목' 뒤 목록 없음, 또는 마지막 줄이 조/항/호 머리뿐.
+  const tail = text.slice(-220);
+  const afterEach = tail.split(/다음\s*각\s*[호목]/);
+  if (afterEach.length > 1 && !LIST_MARKER_RE.test(afterEach[afterEach.length - 1])) {
+    flags.statuteCutoff = 1;
+    warnings.push({ code: "STATUTE_CUTOFF", message: "'다음 각 호' 뒤 목록 없이 끝남 — 본문이 잘렸을 수 있음" });
+  } else if (/(?:^|\n)\s*제\s*\d+\s*[조항호](?:\s*\([^)\n]*\))?\s*$/.test(text)) {
+    flags.statuteCutoff = 1;
+    warnings.push({ code: "STATUTE_CUTOFF", message: "조/항/호 머리만 있고 본문 없이 끝남 — 본문이 잘렸을 수 있음" });
+  }
+
+  // (d) 파일명이 페이지 구간 청크 패턴(...-N-M.ext, M>=N) — 원문 일부일 가능성.
+  const m = String(filename || "").match(/-(\d+)-(\d+)\.[A-Za-z0-9]+$/);
+  if (m && Number(m[2]) >= Number(m[1])) {
+    flags.pageRangeChunk = 1;
+    warnings.push({ code: "PAGE_RANGE_CHUNK", message: `파일명이 페이지 구간 청크(${m[1]}-${m[2]}) 패턴 — 원문 일부일 수 있음(전체성 보장 안 됨)` });
+  }
+
+  return { flags, warnings };
 }
 
 // CLI
@@ -60,4 +119,9 @@ if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
   console.log(`  문제 총합: ${s.problemTotal}`);
   for (const [k, v] of Object.entries(s.issues)) if (v) console.log(`    - ${k}: ${v}`);
   if (s.problemTotal === 0) console.log("  ✅ 주요 품질 문제 없음");
+  const { warnings } = detectBoundaryIssues(md, path);
+  if (warnings.length) {
+    console.log(`  ⚠ 경계 경고 ${warnings.length}건:`);
+    for (const w of warnings) console.log(`    - [${w.code}] ${w.message}`);
+  }
 }

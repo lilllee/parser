@@ -128,6 +128,17 @@ export function aiEnabled(aiConfig) {
   return p.enabled(cfg);
 }
 
+// CLI 에이전트 provider(claude -p)의 이미지(vision) 호출은 매번 풀 에이전트를 cold-boot 하고
+// 간헐적으로 타임아웃까지 행이 걸린다. 그래서 claude-cli 는 기본 '텍스트 전용'으로 동작한다 —
+// kordoc 추출 + 표 텍스트 분석만 하고 OCR/reflow/이미지·차트 같은 vision 단계는 건너뛴다.
+// 행을 감수하고 vision 을 켜려면 CLAUDE_CLI_VISION=1. (codex-cli 는 vision 이 느려도 동작하므로 on.)
+// env 는 호출 시점에 읽는다(.env 가 import 이후 로드되므로 모듈 평가 시점에 읽으면 놓친다).
+export function aiVisionEnabled(aiConfig) {
+  const { id } = aiConfig || currentAiConfig();
+  if (id === "claude-cli") return process.env.CLAUDE_CLI_VISION === "1";
+  return true;
+}
+
 // 실제 전송 없이 provider 의 HTTP 요청 객체만 생성(테스트용).
 export function buildRequest({ providerId, prompt, text, image, maxTokens = 512, temperature = 0.2 }) {
   const id = PROVIDER_ALIASES[providerId] || providerId || process.env.AI_PROVIDER || "vllm";

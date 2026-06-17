@@ -20,7 +20,10 @@ console.log("\n[1] 인구동향: 통계표 다수 → 망가진 페이지 많이
 {
   const r = await blocksOf("2026년 3월 인구동향.pdf");
   const pages = detectMangledPages(r.blocks);
-  ok(pages.length >= 30, `flagged ${pages.length}p (>=30 기대)`);
+  // 플래그 수는 kordoc 개선·오탐 억제로 점차 감소(30→26→~23, 정상 — 깨끗이 파싱된 좋은
+  // 구조표는 OCR 불필요). 특히 isMangledTable 이 'HTML 병합 구조 보존 표'에 느슨한 휴리스틱을
+  // 면제해 좋은 표의 오탐 라우팅을 줄인다. 핵심 검증은 망가진 표가 있는 p6 포함 여부.
+  ok(pages.length >= 20, `flagged ${pages.length}p (>=20 기대)`);
   ok(pages.includes(6), `p6([표2] 시도별 출생아) 포함=${pages.includes(6)}`);
 }
 

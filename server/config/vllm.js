@@ -26,5 +26,7 @@ export const vllmConfig = Object.freeze({
       pageVisual: process.env.VLLM_PAGE_VISUAL !== "0",
       tableAnalysis: process.env.VLLM_TABLE_ANALYSIS === "1",
       spreadSplit: process.env.VLLM_SPREAD_SPLIT !== "0",
+      // 흐름도(화살표 글리프가 든 표) → mermaid 변환. 끄려면 VLLM_FLOWCHART=0.
+      flowchart: process.env.VLLM_FLOWCHART !== "0",
     },
 });

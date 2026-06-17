@@ -22,6 +22,7 @@ const BUILTIN = {
   성분찰설: "성본창설", // 성·본 창설
   응아전담: "영아전담",
   응야전담: "영아전담",
+  근거당: "근저당", // 근저당(권) — '근거당'은 비-단어 오인식
 };
 
 export const ocrCorrections = Object.freeze({ ...BUILTIN, ...loadEnvCorrections() });

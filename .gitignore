@@ -45,3 +45,18 @@ coverage/
 tests/_out_*.json
 tests/_smoke*
 tests/_eval/
+
+# analysis / understanding 도구 산출물 (intermediate graph, scan result 등)
+.understand-anything/
+
+# scratch smoke-check + 디버그 출력 덤프
+_c_unit_check.mjs
+tmp/
+server/*_text.html
+
+# /review eval 업로드 작업 디렉터리 — 가변·대용량 원본(PDF/HWP/JPG), 버전관리 대상 아님
+tests/file/
+
+# pnpm — 이 repo 는 npm(package-lock.json) 사용. pnpm 으로 이전하면 아래 2줄 삭제.
+pnpm-lock.yaml
+pnpm-workspace.yaml

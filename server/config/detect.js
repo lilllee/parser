@@ -27,4 +27,8 @@ export const detectConfig = Object.freeze({
   // 욱여넣은 신호. 정상 표 셀은 길어도 1줄(줄바꿈 없음)이라, '셀 안 줄수'로 구분(글자수 아님:
   // 통계표엔 줄바꿈 없는 긴 셀이 정상 존재). 좁은 표(maxCols 이하)에서만 본다.
   crammedCell: { maxCols: 3, minLines: 10 },
+  // 단위 열이 값 열과 한 셀에 뭉친 표 — kordoc 이 열 분리에 실패한 신호. 예: '명 1,180 1,109',
+  // '% 46 50'. 정상 표는 단위(명/%/개소…)와 값이 별도 셀이므로, 단위 뒤에 숫자가 바로 붙은
+  // 셀이 minCells 개 이상이면 망가진 표로 보고 vision OCR 로 재추출.
+  unitJam: { minCells: 1 },
 });

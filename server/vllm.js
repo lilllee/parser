@@ -13,7 +13,7 @@ const aiCall = (opts) => aiComplete({ maxTokens: cfg.tokens.image, ...opts });
 export async function enrichMarkdown(
   markdown,
   images,
-  { onProgress, onNote, visualPages } = {}
+  { onProgress, onNote, visualPages, vision = true } = {}
 ) {
   if (!markdown) return empty(markdown);
 
@@ -25,7 +25,11 @@ export async function enrichMarkdown(
     imageMap.set(normalizeImageRef(img.filename), url);
   }
 
-  const targets = findTargets(markdown, imageMap, visualPages);
+  // 텍스트 전용 모드(claude-cli 등): 이미지/차트(page-visual) target 은 vision 호출이라 제외하고
+  // 텍스트만 보는 표 분석(table)만 남긴다. (table 분석 자체는 VLLM_TABLE_ANALYSIS=1 일 때만 생성됨)
+  let targets = findTargets(markdown, imageMap, visualPages);
+  // flowchart 는 텍스트 입력(표→mermaid)이라 vision 없이도 가능 → 텍스트 전용 모드에서도 유지.
+  if (!vision) targets = targets.filter((t) => t.type === "table" || t.type === "flowchart");
   if (!targets.length) {
     onProgress?.(1);
     return empty(markdown);
@@ -43,7 +47,9 @@ export async function enrichMarkdown(
         ? `이미지 분석 ${idx + 1}/${targets.length}`
         : t.type === "page-visual"
           ? `차트/그림 분석 ${idx + 1}/${targets.length}`
-          : `표 분석 ${idx + 1}/${targets.length}`
+          : t.type === "flowchart"
+            ? `흐름도 변환 ${idx + 1}/${targets.length}`
+            : `표 분석 ${idx + 1}/${targets.length}`
     );
     try {
       const analysis = await analyzeTarget(t, imageMap);
@@ -62,15 +68,22 @@ export async function enrichMarkdown(
     }
   });
 
-  // 끝에서부터 삽입해야 인덱스가 안 깨짐
-  const insertions = targets
-    .map((t, i) => ({ at: t.index + t.length, text: results[i] }))
-    .filter((x) => x.text)
-    .sort((a, b) => b.at - a.at);
+  // 결과 적용(끝에서부터 — 인덱스 안 깨지게): flowchart 는 표를 mermaid 로 '교체',
+  // 나머지는 target 바로 뒤에 분석 블록 '삽입'.
+  const edits = targets
+    .map((t, i) => {
+      if (!results[i]) return null;
+      const after = t.index + t.length;
+      return t.type === "flowchart"
+        ? { start: t.index, end: after, piece: formatMermaid(results[i]) }
+        : { start: after, end: after, piece: formatInsertion(results[i]) };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.start - a.start);
 
   let out = markdown;
-  for (const ins of insertions) {
-    out = out.slice(0, ins.at) + formatInsertion(ins.text) + out.slice(ins.at);
+  for (const e of edits) {
+    out = out.slice(0, e.start) + e.piece + out.slice(e.end);
   }
 
   return { markdown: out, enriched, skipped, failed, total: targets.length };
@@ -80,7 +93,13 @@ export async function enrichMarkdown(
 // 살리고 산문 줄만 "> " 인용으로 감싼다. 표가 없으면 기존처럼 한 줄 인용.
 // (export 는 단위 테스트용)
 export function formatInsertion(text) {
-  const t = String(text || "").trim();
+  // 일부 provider 가 분석을 #헤딩·---구분선·소제목으로 과포장한다 — 인용 블록 안에서 깨져 보이므로
+  // 헤딩 마커는 평문화하고 수평선 줄은 제거한다(표는 보존). 프롬프트로도 막지만 방어적으로 한 번 더.
+  const t = String(text || "")
+    .replace(/^[ \t]*#{1,6}[ \t]+/gm, "")
+    .replace(/^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
   if (!t) return "";
   if (!/^\s*\|.+\|/m.test(t) && !/<table[\s>]/i.test(t)) {
     return `\n\n> ${t.replace(/\s+/g, " ")}\n`;
@@ -123,9 +142,70 @@ function empty(markdown) {
   return { markdown, enriched: 0, skipped: 0, failed: 0, total: 0 };
 }
 
+// ── 흐름도(flowchart) → mermaid ──────────────────────────────────────────────
+// kordoc 은 HWP/PDF 의 단계 흐름도를 '화살표 글리프(⇨⇩⇦ 등)가 든 표'로 떠온다. 이는 데이터 표가
+// 아니라 흐름도이므로 mermaid 로 변환한다. 표 안에 단계 텍스트+방향이 다 들어있어 페이지 이미지
+// 없이도(HWP 포함) 텍스트만으로 변환 가능하다.
+const FLOW_ARROW_G = /[⇨⇦⇧⇩⟶⟵→←↑↓➡➜➞⬇⬆⬅▶►▼◀]/g;
+
+// 여는 <table> 다음 위치(fromIdx)부터 짝이 맞는 </table> 끝 인덱스를 찾는다(중첩 표 고려).
+function matchTableEnd(md, fromIdx) {
+  const re = /<\/?table\b[^>]*>/gi;
+  re.lastIndex = fromIdx;
+  let depth = 1;
+  let m;
+  while ((m = re.exec(md)) !== null) {
+    if (/^<\//.test(m[0])) { if (--depth === 0) return re.lastIndex; }
+    else depth++;
+  }
+  return -1;
+}
+
+// 흐름 화살표 글리프가 2개 이상 든 최상위 <table> 블록을 흐름도 후보로 잡는다.
+// (export 는 단위 테스트용)
+export function findFlowchartTargets(md, occupied = []) {
+  const targets = [];
+  const openRe = /<table\b[^>]*>/gi;
+  let m;
+  while ((m = openRe.exec(md)) !== null) {
+    const start = m.index;
+    const end = matchTableEnd(md, openRe.lastIndex);
+    if (end < 0) break;
+    const block = md.slice(start, end);
+    if ((block.match(FLOW_ARROW_G) || []).length >= 2 && !overlaps(start, end, occupied)) {
+      targets.push({ type: "flowchart", index: start, length: end - start, text: block });
+      occupied.push([start, end]);
+    }
+    openRe.lastIndex = end; // 표 블록 전체 건너뛰기(중첩 표 재매칭 방지)
+  }
+  return targets;
+}
+
+// AI 응답에서 mermaid 본문만 추출. 흐름도 아님(NO_FLOWCHART)·형식 불량이면 null(원본 표 유지).
+// (export 는 단위 테스트용)
+export function extractMermaid(text) {
+  const t = String(text || "").trim();
+  if (!t || /\bNO_FLOWCHART\b/i.test(t)) return null;
+  const fenced = t.match(/```(?:mermaid)?\s*([\s\S]*?)```/i);
+  const body = (fenced ? fenced[1] : t).trim();
+  if (!/^(?:graph|flowchart|sequenceDiagram|stateDiagram(?:-v2)?|gantt|erDiagram)\b/i.test(body)) return null;
+  return body;
+}
+
+// 교체용: mermaid 본문을 ```mermaid 펜스로 감싼다.
+function formatMermaid(body) {
+  return `\n\n\`\`\`mermaid\n${String(body).trim()}\n\`\`\`\n`;
+}
+
 function findTargets(md, imageMap, visualPages) {
   const targets = [];
   const occupied = [];
+
+  // 흐름도(화살표 글리프가 든 표) → mermaid 변환 대상. 먼저 잡아 occupied 에 올려 표/이미지 분석과
+  // 겹치지 않게 한다.
+  if (cfg.features.flowchart) {
+    targets.push(...findFlowchartTargets(md, occupied));
+  }
 
   // 이미지 reference: ![alt](file) — kordoc 가 추출한 raster image 한정
   const imgRe = /!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
@@ -171,13 +251,22 @@ function findTargets(md, imageMap, visualPages) {
 }
 
 async function analyzeTarget(t, imageMap) {
+  if (t.type === "flowchart") {
+    const out = await aiCall({
+      prompt: prompts.flowchartToMermaid,
+      text: t.text,
+      maxTokens: cfg.tokens.pageVisual,
+    });
+    // mermaid 추출 실패/흐름도 아님이면 null → enrichMarkdown 이 원본 표를 그대로 둔다.
+    return extractMermaid(out);
+  }
   if (t.type === "image") {
     const url = t.imageUrl || imageMap.get(t.file) || imageMap.get(normalizeImageRef(t.file));
     if (!url) return null;
-    return aiCall({
-      image: url,
-      prompt: prompts.imageAnalysis,
-    });
+    const out = await aiCall({ image: url, prompt: prompts.imageAnalysis });
+    // 로고·도장·서명·장식 등 정보성 없는 이미지는 삽입하지 않는다(거짓/잡음 블록 방지).
+    if (!out || isNoVisualResponse(out)) return null;
+    return out;
   }
   if (t.type === "table") {
     let text = t.text;
@@ -223,17 +312,137 @@ const OCR_SAMPLING = Object.freeze({
   frequencyPenalty: Number(process.env.VLLM_OCR_FREQUENCY_PENALTY ?? 0),
 });
 
+// 복잡한 표(병합·중첩)에서 모델이 markdown 으로 표를 깨뜨리는 출력 신호. 결정적으로 감지해
+// 재시도한다 — 모델이 같은 페이지를 절반쯤은 올바른 HTML 로 그리므로 몇 번 재시도하면 수렴.
+const TABLE_MAX_RETRY = Number(process.env.VLLM_OCR_TABLE_RETRY ?? 2);
+export function hasBrokenTable(text) {
+  if (!text) return false;
+  if (/\|[^\n|]*(?:row|col)span\s*=/i.test(text)) return true; // markdown 칸에 rowspan/colspan 텍스트 누출
+  if (/<br>\s*\|/.test(text)) return true; // 표를 <br>+| 로 셀에 욱여넣음(중첩 표 실패)
+  if (hasMalformedHtmlTable(text)) return true;
+  // 연속 파이프표 블록 검사: 구분행이 2개 이상(하위표가 같은 블록에 흘러나옴) 또는 행별 칸 수
+  // 불일치(병합/중첩을 markdown 으로 누른 흔적). 정상 markdown 표는 구분행 1개·직사각형.
+  const isPipe = (l) => /^\s*\|.*\|\s*$/.test(l);
+  const isSep = (l) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);
+  const lines = String(text).split("\n");
+  for (let i = 0; i < lines.length; ) {
+    if (!isPipe(lines[i])) { i++; continue; }
+    const block = [];
+    while (i < lines.length && isPipe(lines[i])) block.push(lines[i++]);
+    if (block.length < 2) continue;
+    if (block.filter(isSep).length >= 2) return true; // 구분행 2개+ = 하위표 흘러나옴
+    const widths = block.filter((l) => !isSep(l)).map((l) => l.split("|").length);
+    if (widths.length && Math.max(...widths) - Math.min(...widths) >= 2) return true; // 칸 수 불일치
+  }
+  return false;
+}
+
+function hasMalformedHtmlTable(text) {
+  if (!/<table[\s>]/i.test(text)) return false;
+  for (const table of extractTopLevelTables(String(text))) {
+    // 병합 헤더를 두 칸짜리 "구분" + 빈 헤더칸으로 쪼개면 시각적으로는 비슷해도
+    // 왼쪽 다중 구분 열의 의미가 밀린다. colspan 을 정확히 써야 한다.
+    if (/<th\b[^>]*colspan\s*=\s*["']?2["']?[^>]*>\s*구\s*분\s*<\/th>\s*<th\b[^>]*>\s*<\/th>/i.test(table)) {
+      return true;
+    }
+
+    const widths = htmlTableRowWidths(stripNestedTables(table));
+    if (widths.length < 2) continue;
+    const positive = widths.filter((n) => n > 0);
+    if (positive.length < 2) continue;
+    const max = Math.max(...positive);
+    const min = Math.min(...positive);
+    if (max - min >= 2) return true;
+  }
+  return false;
+}
+
+function extractTopLevelTables(text) {
+  const blocks = [];
+  const tagRe = /<\/?table\b[^>]*>/gi;
+  const stack = [];
+  let m;
+  while ((m = tagRe.exec(text)) !== null) {
+    const isClose = /^<\//.test(m[0]);
+    if (!isClose) {
+      stack.push(m.index);
+    } else if (stack.length) {
+      const start = stack.pop();
+      if (stack.length === 0) blocks.push(text.slice(start, tagRe.lastIndex));
+    }
+  }
+  return blocks;
+}
+
+function stripNestedTables(table) {
+  const tagRe = /<\/?table\b[^>]*>/gi;
+  const ranges = [];
+  let depth = 0;
+  let nestedStart = -1;
+  let m;
+  while ((m = tagRe.exec(table)) !== null) {
+    const isClose = /^<\//.test(m[0]);
+    if (!isClose) {
+      if (depth === 1) nestedStart = m.index;
+      depth++;
+    } else {
+      if (depth === 2 && nestedStart >= 0) {
+        ranges.push([nestedStart, tagRe.lastIndex]);
+        nestedStart = -1;
+      }
+      depth = Math.max(0, depth - 1);
+    }
+  }
+  let out = table;
+  for (let i = ranges.length - 1; i >= 0; i--) {
+    const [start, end] = ranges[i];
+    out = out.slice(0, start) + "[nested table]" + out.slice(end);
+  }
+  return out;
+}
+
+function htmlTableRowWidths(table) {
+  const rows = table.match(/<tr\b[\s\S]*?<\/tr>/gi) || [];
+  const activeRowspans = [];
+  const widths = [];
+  for (const row of rows) {
+    let col = 0;
+    const occupyPrior = () => {
+      while ((activeRowspans[col] || 0) > 0) {
+        activeRowspans[col]--;
+        col++;
+      }
+    };
+    const cellRe = /<t[dh]\b([^>]*)>[\s\S]*?<\/t[dh]>/gi;
+    let m;
+    while ((m = cellRe.exec(row)) !== null) {
+      occupyPrior();
+      const attrs = m[1] || "";
+      const colspan = Math.max(1, Number((attrs.match(/\bcolspan\s*=\s*["']?(\d+)/i) || [])[1] || 1));
+      const rowspan = Math.max(1, Number((attrs.match(/\browspan\s*=\s*["']?(\d+)/i) || [])[1] || 1));
+      if (rowspan > 1) {
+        for (let i = 0; i < colspan; i++) activeRowspans[col + i] = Math.max(activeRowspans[col + i] || 0, rowspan - 1);
+      }
+      col += colspan;
+    }
+    occupyPrior();
+    widths.push(col);
+  }
+  return widths;
+}
+
 // 페이지 OCR 본체 — 실패 시 throw (호출부에서 스케일 재시도 등 판단).
 // 공통 지시문은 system 으로(byte 동일 → prefix cache), 페이지 번호 등 가변값은 user 로.
-async function vllmOcrPageStrict(pageImage, pageNumber, mimeType = "image/png") {
+async function vllmOcrPageStrict(pageImage, pageNumber, mimeType = "image/png", samplingOverride = null, extraInstruction = "") {
   const b64 = Buffer.from(pageImage).toString("base64");
   const url = `data:${mimeType};base64,${b64}`;
   const text = await aiCall({
     image: url,
     system: prompts.pdfOcrSystem,
-    prompt: prompts.pdfOcrUser(pageNumber),
+    prompt: prompts.pdfOcrUser(pageNumber) + (extraInstruction ? `\n${extraInstruction}` : ""),
     maxTokens: cfg.tokens.ocr,
     ...OCR_SAMPLING,
+    ...(samplingOverride || {}),
     timeoutMs: cfg.timeouts.ocrMs,
   });
   return cleanOcrText(text);
@@ -280,8 +489,9 @@ function cleanOcrText(text) {
 }
 
 // 일부 provider(gemini 등)는 bmp/gif/tiff 를 거부 → png/jpeg/webp 가 아니면 PNG 로 변환.
+// (export 는 이미지 파일 변환 경로에서 page-visual enrich 입력 URL 을 만들 때 재사용)
 const AI_SAFE_IMAGE = /^image\/(png|jpe?g|webp)$/i;
-async function toSafeImageUrl(data, mime = "image/png") {
+export async function toSafeImageUrl(data, mime = "image/png") {
   const buf = Buffer.from(data);
   if (AI_SAFE_IMAGE.test(mime)) return `data:${mime};base64,${buf.toString("base64")}`;
   try {
@@ -299,6 +509,13 @@ const VISUAL_LINE_RE =
   /(^|\n)([^\n]*(?:Figure|Fig\.|Chart|Graph|Table|그림|도표|차트|그래프|통계|추이|분포|비율|매출|실적)[^\n]*)/gi;
 const VISUAL_CAPTION_RE =
   /(?:Figure|Fig\.|Chart|Graph|Table|그림|도표|차트|그래프|표)\s*\d+/i;
+
+// 스캔본 OCR 시 page-visual enrich 입력으로 모을 페이지 단서(차트/그림 위주 — 표는 전사로 충분).
+const VISUAL_CUE_RE = /그림|도표|차트|그래프|다이어그램|통계|추이|분포|증감|Figure|Fig\.|Chart|Graph|Diagram/i;
+// page-visual 입력 이미지는 OCR 해상도보다 작게 렌더(데이터 URL 크기·enrich 통과율 고려).
+const VISUAL_RENDER_FACTOR = Number(process.env.VLLM_VISUAL_RENDER_FACTOR ?? 0.6);
+// 스캔본 한 건에서 모을 시각 페이지 상한(차트 enrich 호출 수·메모리 폭주 방지).
+const VISUAL_PAGE_CAP = Number(process.env.VLLM_VISUAL_PAGE_CAP ?? 30);
 
 function findVisualPageTargets(md, visualPages, occupied) {
   if (!visualPages?.length) return [];
@@ -445,10 +662,21 @@ async function openPdfRenderer(arrayBuffer) {
   };
 }
 
+// 텍스트 내 표 개수(HTML <table> + markdown 구분행). vision 이 표를 빠뜨렸는지 판단용.
+function countTables(text) {
+  const html = (String(text).match(/<table[\s>]/gi) || []).length;
+  const mdSep = (String(text).match(/^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/gm) || []).length;
+  return html + mdSep;
+}
+
 // 렌더 → OCR 1页. 컨텍스트 초과(400)면 0.7배로 줄여 1회 재시도. 그 외 실패는 "" (페이지 단위 격리).
-async function ocrPageAdaptive(renderer, pageNum) {
+// expectedTables: kordoc 가 그 페이지에서 본 '실제 표' 개수 — vision 출력이 이보다 적으면(표 누락/
+// 본문에 흡수) 깨진 것으로 보고 재시도한다(사용자 사례: '26년 예산 표가 통째로 누락된 케이스).
+async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0) {
+  let png = null;
+  let text = null;
+  // 1) 렌더 → OCR. 컨텍스트 초과(400)면 0.7배로 줄여 1회 재시도.
   for (const factor of [1, 0.7]) {
-    let png;
     try {
       png = renderer.renderPage(pageNum, factor);
     } catch (e) {
@@ -456,7 +684,8 @@ async function ocrPageAdaptive(renderer, pageNum) {
       return "";
     }
     try {
-      return await vllmOcrPageStrict(png, pageNum, "image/png");
+      text = await vllmOcrPageStrict(png, pageNum, "image/png");
+      break;
     } catch (e) {
       if (factor === 1 && isContextOverflow(e)) {
         console.warn(`[vllm-ocr] page ${pageNum} 컨텍스트 초과 — 0.7배 축소 재시도`);
@@ -466,15 +695,33 @@ async function ocrPageAdaptive(renderer, pageNum) {
       return "";
     }
   }
-  return "";
+  if (text == null) return "";
+  // 2) 표가 깨졌거나(병합/중첩을 markdown 으로 누름) 표를 빠뜨렸으면(개수 부족) 재시도.
+  const bad = (t) => hasBrokenTable(t) || (expectedTables > 0 && countTables(t) < expectedTables);
+  for (let r = 0; r < TABLE_MAX_RETRY && bad(text); r++) {
+    const why = hasBrokenTable(text) ? "표 깨짐" : `표 누락(${countTables(text)}/${expectedTables})`;
+    console.warn(`[vllm-ocr] page ${pageNum} ${why} 감지 — 재시도 ${r + 1}/${TABLE_MAX_RETRY}`);
+    try {
+      const retry = await vllmOcrPageStrict(png, pageNum, "image/png", { temperature: 0.4 }, prompts.pdfOcrTableRetry);
+      if (retry && !bad(retry)) return retry;
+      if (retry && countTables(retry) > countTables(text)) text = retry; // 더 완전한 쪽 유지
+    } catch (e) {
+      console.warn(`[vllm-ocr] page ${pageNum} 표 재시도 실패:`, e?.message || e);
+      break;
+    }
+  }
+  return text;
 }
 
 // 스캔본(IMAGE_BASED_PDF) fallback: 전 페이지 lazy 렌더 → OCR → markdown 합성.
-export async function ocrPdfBuffer(arrayBuffer, { onProgress, onPage } = {}) {
+// collectVisuals: 차트/그림 단서가 있는 페이지의 렌더 이미지를 page-visual enrich 입력으로 함께 모은다.
+// (OCR 프롬프트는 전사만 하고 시각자료 해설은 enrich 가 담당하므로 그 입력을 여기서 공급한다.)
+export async function ocrPdfBuffer(arrayBuffer, { onProgress, onPage, collectVisuals = true } = {}) {
   const renderer = await openPdfRenderer(arrayBuffer);
   const pageCount = renderer.pageCount;
   const pageNums = Array.from({ length: pageCount }, (_, i) => i + 1);
   const texts = new Array(pageCount).fill("");
+  const visualPages = [];
   let okCount = 0;
   let done = 0;
 
@@ -484,6 +731,19 @@ export async function ocrPdfBuffer(arrayBuffer, { onProgress, onPage } = {}) {
     if (clean) {
       texts[idx] = clean;
       okCount++;
+      // 차트/그림 단서가 있는 페이지만 enrich 후보로 캡처(상한·축소 렌더로 비용 제한).
+      if (collectVisuals && visualPages.length < VISUAL_PAGE_CAP && VISUAL_CUE_RE.test(clean)) {
+        try {
+          const png = renderer.renderPage(page, VISUAL_RENDER_FACTOR);
+          visualPages.push({
+            page,
+            image: `data:image/png;base64,${png.toString("base64")}`,
+            blocks: [{ content: clean }],
+          });
+        } catch (e) {
+          console.warn(`[vllm-ocr] page ${page} visual 캡처 실패:`, e?.message || e);
+        }
+      }
     }
     onProgress?.(++done / (pageCount || 1));
   });
@@ -494,7 +754,8 @@ export async function ocrPdfBuffer(arrayBuffer, { onProgress, onPage } = {}) {
     )
     .filter(Boolean);
 
-  return { markdown: sections.join("\n\n---\n\n"), pageCount, ocrPages: okCount };
+  visualPages.sort((a, b) => a.page - b.page);
+  return { markdown: sections.join("\n\n---\n\n"), pageCount, ocrPages: okCount, visualPages };
 }
 
 // 2-page spread(펼침면): landscape 페이지 폭이 세로 페이지 폭의 ~2배면 펼침면으로 판정한다.
@@ -590,10 +851,11 @@ async function splitPngHalves(png) {
   return [crop(0, halfW), crop(halfW, W - halfW)];
 }
 
-export async function ocrSelectedPdfPages(arrayBuffer, pageNumbers, { onPage, spreadPages } = {}) {
+export async function ocrSelectedPdfPages(arrayBuffer, pageNumbers, { onPage, spreadPages, expectedTables } = {}) {
   const want = [...new Set((pageNumbers || []).filter((n) => n > 0))].sort((a, b) => a - b);
   if (!want.length) return new Map();
   const spreads = spreadPages instanceof Set ? spreadPages : new Set(spreadPages || []);
+  const expTbl = expectedTables instanceof Map ? expectedTables : new Map();
   const renderer = await openPdfRenderer(arrayBuffer);
   const totalUnits = want.reduce((s, p) => s + (spreads.has(p) ? 2 : 1), 0);
 
@@ -602,7 +864,7 @@ export async function ocrSelectedPdfPages(arrayBuffer, pageNumbers, { onPage, sp
   await mapWithLimit(want, cfg.concurrency.ocr, async (page) => {
     // 일반 페이지(또는 분할 실패 fallback): 통짜 OCR.
     const wholePage = async () => {
-      const t = (await ocrPageAdaptive(renderer, page)).trim();
+      const t = (await ocrPageAdaptive(renderer, page, expTbl.get(page) || 0)).trim();
       onPage?.(++done, totalUnits, page);
       if (t) texts.set(page, t);
     };

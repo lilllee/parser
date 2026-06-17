@@ -68,11 +68,24 @@ export function hasAxisTickRun(block) {
 }
 
 // 원형/막대 차트 라벨이 표 셀 하나에 뭉친 경우 ("48.9% 23.7% 41.6%" 한 셀).
+// 정상 예산표도 "균특 50%, 도비 25%, 시군비 25%"처럼 한 셀에 %가 여럿 들어가므로,
+// 퍼센트값을 걷어낸 뒤 남는 텍스트가 거의 없는 값-라벨 뭉침만 차트 잔해로 본다.
+const PERCENT_TOKEN = /\d+(?:\.\d+)?\s*%/g;
+function isPercentValueCluster(text) {
+  const raw = String(text || "");
+  const tokens = raw.match(PERCENT_TOKEN) || [];
+  if (tokens.length < cfg.chartArtifact.cellPercentTokens) return false;
+  const rest = raw
+    .replace(PERCENT_TOKEN, "")
+    .replace(/[()\[\],.:;%~∼\-–—/\\\s]/g, "")
+    .trim();
+  const letters = rest.match(/[A-Za-z가-힣]/g) || [];
+  return letters.length <= 2;
+}
 export function isPercentCramTable(table) {
   if (!table?.cells) return false;
   return table.cells.flat().some((c) => {
-    const tokens = ((c?.text || "").match(/\d+(?:\.\d+)?\s*%/g) || []).length;
-    return tokens >= cfg.chartArtifact.cellPercentTokens;
+    return isPercentValueCluster(c?.text || "");
   });
 }
 
@@ -98,6 +111,21 @@ export function isDuplicateColumnTable(table) {
     if (found) dup++;
   }
   return comparable >= cfg.dupColumnTable.minRows && dup / comparable >= cfg.dupColumnTable.dupRatio;
+}
+
+// 단위 열이 값 열과 한 셀에 뭉친 표. kordoc 이 '단위 | 실적 | 목표' 열을 분리하지 못해 한 셀에
+// '명 1,180 1,109' / '% 46 50' 처럼 단위+값들을 뭉친 신호 — 정상 표는 단위와 값이 별도 셀이다.
+// (단위 단어 바로 뒤에 숫자가 붙은 셀이 minCells 개 이상이면 망가진 표.)
+const UNIT_JAM = /(?:^|\s)(?:개소|명|반|건수|가구|개반|건|곳|원|천원|백만원|시간|일|회|%)\s+-?\d/;
+export function hasUnitJammedCells(table) {
+  if (!table?.cells) return false;
+  let jammed = 0;
+  for (const row of table.cells) {
+    for (const c of row || []) {
+      if (UNIT_JAM.test(c?.text || "")) jammed++;
+    }
+  }
+  return jammed >= cfg.unitJam.minCells;
 }
 
 // 한 셀에 여러 줄(문단/구간)이 통째로 뭉친 표 — kordoc 이 칸 구조를 잃고 본문을 셀 하나에
@@ -190,13 +218,51 @@ export function detectScatteredNumberPages(blocks) {
   return pages;
 }
 
+// kordoc 가 병합 구조를 잡아 HTML 로 렌더하는 표(colSpan/rowSpan>1 셀 보유).
+export function isStructuredTable(table) {
+  return (table?.cells || []).some((row) => (row || []).some((c) => (c?.colSpan > 1) || (c?.rowSpan > 1)));
+}
+
+// 한 셀에 공백으로 구분된 숫자가 3개 이상 연달아 — 여러 열 값이 한 셀에 뭉친 신뢰 신호.
+// 예: '3.6 6.8 7.3 8.1', '238,317 254,457 21,112'. (콤마는 천단위, 토큰 구분은 공백)
+const JAMMED_NUMS = /(?:^|\s)-?\d[\d,]*(?:\.\d+)?\s+-?\d[\d,]*(?:\.\d+)?\s+-?\d[\d,]*(?:\.\d+)?(?:\s|$)/;
+export function hasJammedNumberCell(table) {
+  return (table?.cells || []).some((row) => (row || []).some((c) => JAMMED_NUMS.test(c?.text || "")));
+}
+
+// 쉼표 단위 숫자 두 개가 구분자 없이 붙은 경우. 예: "6,167,500990,000",
+// "1,580,00050,000". kordoc 이 두 행의 금액을 한 셀에 합치면 중간 comma group 이 4자리
+// 이상으로 길어져 정상 천단위 표기와 구분된다.
+const GLUED_COMMA_NUM = /\d{1,3}(?:,\d{3})*,\d{4,}(?:,\d{3})+/;
+export function hasGluedCommaNumberCell(table) {
+  return (table?.cells || []).some((row) => (row || []).some((c) => GLUED_COMMA_NUM.test(c?.text || "")));
+}
+
+// 표가 망가졌는가(vision 재추출 필요).
+// - 신뢰 신호(중복컬럼·셀뭉침·단위뭉침·값뭉침)는 구조와 무관하게 항상 본다(병합 표라도 값이
+//   뭉쳤으면 망가진 것 — 인구동향 p6 사례).
+// - 느슨한 휴리스틱(prose/garbled/percentCram)은 '구조 보존 표(HTML 병합)'에는 면제한다 —
+//   좋은 kordoc HTML 표가 %주석·병합 빈셀 때문에 오탐돼 vision 으로 가 깨지는 걸 막는다.
+export function isMangledTable(table) {
+  if (!table?.cells) return false;
+  if (
+    isDuplicateColumnTable(table) ||
+    isCrammedCellTable(table) ||
+    hasUnitJammedCells(table) ||
+    hasJammedNumberCell(table) ||
+    hasGluedCommaNumberCell(table)
+  ) return true;
+  if (isStructuredTable(table)) return false;
+  return isProseFakeTable(table) || isGarbledDataTable(table) || isPercentCramTable(table);
+}
+
 // 망가진 페이지 번호(1-based) 오름차순, 중복 제거. pageCount 를 주면 저밀도 신호도 포함.
 export function detectMangledPages(blocks, pageCount = 0) {
   const pages = new Set();
   const glyphByPage = new Map();
   for (const b of blocks || []) {
     if (!b.pageNumber) continue;
-    if (b.type === "table" && (isProseFakeTable(b.table) || isGarbledDataTable(b.table) || isPercentCramTable(b.table) || isDuplicateColumnTable(b.table) || isCrammedCellTable(b.table))) {
+    if (b.type === "table" && isMangledTable(b.table)) {
       pages.add(b.pageNumber);
     } else if (isPipeTableParagraph(b) || hasBrokenKoreanSpacing(b)) {
       pages.add(b.pageNumber);

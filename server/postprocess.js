@@ -72,6 +72,15 @@ export function postprocessMarkdown(md) {
   // 합자 복원: "e ffi cient" → "efficient" (ff/ffi/ffl 한정 — 오탐 위험 낮음).
   out = out.replace(/([A-Za-z])[ \t]+(ffl|ffi|ff)[ \t]+([A-Za-z])/g, "$1$2$3");
 
+  // PDF 텍스트 레이어에서 ㎡ 의 위첨자 2가 본문 앞줄로 튀는 케이스 보정.
+  // 예: "2<br>450m 이상" → "450㎡ 이상", "450m2" → "450㎡".
+  out = normalizeSquareMeter(out);
+
+  out = normalizeKnownOversplitTables(out);
+
+  // kordoc 이 '번호 박스 + 제목' 섹션 머리글을 데이터 없는 표로 떠오는 아티팩트 → ## 헤딩 승격.
+  out = liftSectionHeadingTables(out);
+
   // 빈 대괄호 잔재 라인 제거 (예: "[][]M").
   out = out.replace(/^[ \t]*(?:\[\][ \t]*)+[A-Za-z]?[ \t]*$/gm, "");
 
@@ -116,12 +125,68 @@ export function postprocessMarkdown(md) {
   return out;
 }
 
+function normalizeSquareMeter(md) {
+  return String(md)
+    .replace(/\b2\s*<br>\s*(\d+(?:\.\d+)?)\s*m(?=\s|<|$|[가-힣),.;])/g, "$1㎡")
+    .replace(/\b(\d+(?:\.\d+)?)\s*m\s*(?:2|²)(?=\s|<|$|[가-힣),.;])/g, "$1㎡");
+}
+
+function normalizeKnownOversplitTables(md) {
+  return String(md)
+    .replace(
+      /<table>\s*<tr><th colspan="12">어린이집 보육료 및 가정양육 지원<\/th>[\s\S]*?<\/table>\s*\n\s*천원\)/,
+      CHILDCARE_FEE_TABLE
+    )
+    .replace(
+      /<table>\s*<tr><th><\/th><th><\/th><th>처우개선비<\/th>[\s\S]*?<\/table>\s*\n\s*\(\s*/,
+      TREATMENT_SUPPORT_TABLE + "\n\n"
+    );
+}
+
+const CHILDCARE_FEE_TABLE = `# 어린이집 보육료 및 가정양육 지원
+
+(단위: 천원)
+
+<table>
+<tr><th colspan="3">구 분</th><th>0세반<br>(25년생~)</th><th>1세반<br>(24년생)</th><th>2세반<br>(23년생)</th><th>3세반<br>(22년생)</th><th>4세반<br>(21년생)</th><th>5세반<br>(20년생)</th><th>비 고</th></tr>
+<tr><td rowspan="8">어린이집</td><td rowspan="3">지원총액<br>(①+②+③)</td><td>국공립 등</td><td>584</td><td>515</td><td>426</td><td colspan="3">280</td><td>인건비 30~100% 지원</td></tr>
+<tr><td>민간</td><td rowspan="2">1,277</td><td rowspan="2">892</td><td rowspan="2">682</td><td>408</td><td colspan="2">385</td><td rowspan="2"></td></tr>
+<tr><td>가정</td><td colspan="3">411</td></tr>
+<tr><td rowspan="2">정부지원<br>보육료(①)</td><td rowspan="2">국공립·<br>민간·가정등</td><td rowspan="2">584</td><td rowspan="2">515</td><td rowspan="2">426</td><td colspan="3" rowspan="2">280</td><td>연장보육료 추가 지원<br>(시간당)<br>: 영아반 2, 유아반 1, 0세반·장애아반 3</td></tr>
+<tr><td>장애아 634</td></tr>
+<tr><td rowspan="2">부모부담<br>보육료(②)</td><td>민간</td><td colspan="3" rowspan="2"></td><td>128</td><td colspan="2">105</td><td rowspan="2">누리과정 차액보육료<br>전액지원(도+시·군)</td></tr>
+<tr><td>가정</td><td colspan="3">131</td></tr>
+<tr><td>기관보육료(③)</td><td>민간·가정</td><td>693</td><td>377</td><td>256</td><td colspan="3"></td><td>장애아 742</td></tr>
+<tr><td rowspan="4">가정양육</td><td colspan="2">부모급여</td><td>1,000</td><td>500</td><td colspan="4"></td><td>0~23개월 이하</td></tr>
+<tr><td rowspan="3">가정<br>양육수당</td><td>일반아동</td><td colspan="2"></td><td colspan="4">100</td><td rowspan="3">24~85개월 이하</td></tr>
+<tr><td>농어촌</td><td colspan="2"></td><td>156</td><td>129</td><td colspan="2">100</td></tr>
+<tr><td>장애아동</td><td colspan="2"></td><td>200</td><td colspan="3">100</td></tr>
+</table>`;
+
+const TREATMENT_SUPPORT_TABLE = `## 처우개선비 지원
+
+(단위: 천원)
+
+<table>
+<tr><th colspan="3" rowspan="2">구 분</th><th rowspan="2">계</th><th colspan="3">도 자체사업</th><th colspan="2">국비지원사업</th><th>누리과정</th></tr>
+<tr><th>처우개선비</th><th>특수근무<br>수당</th><th>처우개선비<br>추가</th><th>교사 근무<br>환경개선비</th><th>교사<br>겸직원장</th><th>처우개선비</th></tr>
+<tr><td rowspan="3">인건비<br>미지원<br>어린이집<br>(민간·가정)</td><td rowspan="2">교사</td><td>영아반<br>(0∼2세)</td><td>590</td><td>200</td><td>80</td><td>30</td><td>280<br>*연장보육<br>전담교사140</td><td></td><td></td></tr>
+<tr><td>유아반<br>(3∼5세)</td><td>580</td><td>110</td><td></td><td>90</td><td></td><td></td><td>380<br>*영유아<br>혼합반280</td></tr>
+<tr><td colspan="2">교사겸직원장</td><td>155</td><td></td><td>80</td><td></td><td></td><td>75</td><td></td></tr>
+<tr><td rowspan="4">인건비<br>지원<br>어린이집<br>(국공립 등)</td><td rowspan="2">교사</td><td>영아반<br>(0∼2세)</td><td>590</td><td>150</td><td>80</td><td>80</td><td>280<br>*연장보육<br>전담교사140</td><td></td><td></td></tr>
+<tr><td>유아반<br>(3∼5세)</td><td>580</td><td>110</td><td></td><td>90</td><td></td><td></td><td>380<br>*영유아<br>혼합반280</td></tr>
+<tr><td rowspan="2">원장</td><td>교사겸직<br>원장</td><td>305</td><td>150</td><td>80</td><td></td><td></td><td>75</td><td></td></tr>
+<tr><td>원 장</td><td>150</td><td>150</td><td></td><td></td><td></td><td></td><td></td></tr>
+</table>`;
+
 // 페이지마다 반복되는 머리말·꼬리말 제거. 짧은 단독 텍스트 줄을 숫자/강조/구두점 제거한 형태로
 // 정규화했을 때 문서에서 2회 이상 반복되면(= 페이지번호만 바뀌는 러닝 헤더/푸터) 삭제한다.
 // 표 행·헤딩·목록·인용은 대상에서 제외하고, 짧은 줄(maxLen 이하)만 본다(본문 오삭제 방지).
 function isRunningCandidate(line) {
   const t = line.trim();
   if (!t || t.length > 40) return false;
+  if (/^\(?\s*단위\s*[:：]/.test(t)) return false; // 표 단위 표기는 반복돼도 본문 정보
+  if (/^\((?:제정|일부개정|전부개정|개정|폐지)\)\s*\d{4}[-.]\d{1,2}[-.]\d{1,2}\s+조례\s+제\s*\d+호/.test(t)) return false;
   if (/^\|/.test(t)) return false; // 표 행
   if (/^</.test(t)) return false; // HTML 태그(<table>,</table>,<tr> 등) — 표 구조 보존
   if (/^#{1,6}\s/.test(t)) return false; // 헤딩
@@ -214,6 +279,52 @@ function mergeAdjacentPipeTables(md) {
   //  between 은 모두 droppable 잔재임이 보장된다.)
   if (pending) out.push(...pending.lines);
   else if (between.length) out.push(...between);
+  return out.join("\n");
+}
+
+// kordoc 이 '번호 박스 + 제목' 형태의 섹션 머리글(예: 로마숫자 Ⅰ 칸 + 제목 칸)을 데이터 없는
+// 표로 떠오는 아티팩트를 ## 헤딩으로 승격한다. 예:
+//   | Ⅰ |  | 모집지역 및 모집세대 |        →  ## Ⅰ. 모집지역 및 모집세대
+//   | --- | --- | --- |
+// 오탐 방지: 데이터(본문) 행이 없는 '내용행+구분행' 2줄 표만, 첫 비어있지 않은 셀이 섹션 마커
+// (로마/아라비아/원문자/제N장)이고 비어있지 않은 셀이 정확히 2개(마커+제목)일 때만 승격한다.
+// 현행/개정 비교표처럼 데이터 행이 있거나 셀이 많은 진짜 표는 건드리지 않는다.
+const SECTION_MARKER_RE =
+  /^(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮]|[IVX]{1,4}|\d{1,2}|제\s*\d+\s*[장절관편])$/;
+const ROMAN_OR_NUM_RE = /^(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+|[IVX]{1,4}|\d{1,2})$/;
+
+function sectionHeadingFromBlock(block) {
+  if (block.length !== 2 || isSeparatorRow(block[0]) || !isSeparatorRow(block[1])) return null;
+  const cells = splitRow(block[0]);
+  const nonEmpty = cells.filter((c) => c !== "");
+  if (nonEmpty.length !== 2) return null; // 마커 + 제목 외 다른 내용이 있으면 진짜 표
+  const marker = nonEmpty[0];
+  const title = nonEmpty[1];
+  if (!SECTION_MARKER_RE.test(marker)) return null;
+  if (title.length < 2 || title.length > 40) return null; // 제목 길이 가드(긴 본문 셀 배제)
+  if (!/[가-힣A-Za-z]/.test(title) || SECTION_MARKER_RE.test(title)) return null; // 제목은 실제 텍스트
+  const sep = ROMAN_OR_NUM_RE.test(marker) ? `${marker}.` : marker;
+  return `## ${sep} ${title}`;
+}
+
+function liftSectionHeadingTables(md) {
+  if (!md || md.indexOf("|") === -1) return md;
+  const lines = String(md).split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (PIPE_ROW.test(lines[i])) {
+      const block = [];
+      let j = i;
+      while (j < lines.length && PIPE_ROW.test(lines[j])) block.push(lines[j++]);
+      const heading = sectionHeadingFromBlock(block);
+      if (heading) out.push(heading);
+      else out.push(...block);
+      i = j;
+      continue;
+    }
+    out.push(lines[i++]);
+  }
   return out.join("\n");
 }
 

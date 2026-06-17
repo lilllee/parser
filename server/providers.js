@@ -321,9 +321,33 @@ function runClaude(bin, args, timeoutMs) {
     child.on("error", (e) => { clearTimeout(timer); reject(e); });
     child.on("close", (code) => {
       clearTimeout(timer);
-      code !== 0 ? reject(new Error(`claude exited ${code}: ${err.slice(0, 300)}`)) : resolve(out);
+      code !== 0 ? reject(new Error(formatClaudeExit(code, out, err))) : resolve(out);
     });
   });
+}
+
+function formatClaudeExit(code, out, err) {
+  const parts = [];
+  const stdout = String(out || "").trim();
+  const stderr = String(err || "").trim();
+  if (stdout) {
+    try {
+      const json = JSON.parse(stdout);
+      const msg = [
+        json.result,
+        json.api_error_status,
+        json.subtype,
+        json.terminal_reason,
+        json.stop_reason,
+      ].filter(Boolean).join(" | ");
+      if (msg) parts.push(msg);
+    } catch {
+      parts.push(stdout);
+    }
+  }
+  if (stderr) parts.push(stderr);
+  const detail = parts.join(" | ").replace(/\s+/g, " ").slice(0, 600);
+  return `claude exited ${code}${detail ? `: ${detail}` : ""}`;
 }
 
 const claudeCliProvider = {
@@ -349,10 +373,19 @@ const claudeCliProvider = {
           promptText = `Read the image at ${imgPath} and ${prompt}`;
         }
       }
+      // --strict-mcp-config: 사용자 개인 MCP 서버(Gmail/Drive/Figma 등)를 0개만 로딩.
+      // 안 붙이면 매 OCR 호출마다 원격 MCP 전부에 연결을 시도해 startup 이 수초~행으로 늘어난다
+      // (인증 필요한 서버는 timeout 까지 블록 → "호출 자체가 안 되는" 것처럼 보임). OCR 은 MCP 불필요.
       const args = ["-p", promptText, "--model", cfg.model,
-        "--output-format", "json", "--permission-mode", "bypassPermissions"];
+        "--output-format", "json", "--permission-mode", "bypassPermissions",
+        "--strict-mcp-config"];
       if (imgPath) args.push("--allowedTools", "Read");
-      const stdout = await runClaude(resolveClaudeBin(), args, timeoutMs || cfg.timeout_ms);
+      // OCR 경로는 timeoutMs=240s(vLLM 기준)를 넘겨오지만, claude -p 는 매 호출이 에이전트를
+      // cold-boot 하는 데다 간헐적으로 행이 걸려 한 호출이 240s 를 다 태우면 4분간 멈춘 것처럼
+      // 보인다. claude 전용 상한(cfg.timeout_ms, 기본 120s)으로 클램프 — 정상 페이지 OCR 은
+      // ~36s 라 120s 면 충분하고, 행은 절반 시간에 끊어 사용자 대기를 줄인다.
+      const limitMs = Math.min(timeoutMs || cfg.timeout_ms, cfg.timeout_ms);
+      const stdout = await runClaude(resolveClaudeBin(), args, limitMs);
       const json = JSON.parse(stdout);
       if (json.is_error) throw new Error(json.result || "claude cli error");
       return (json.result || "").trim();

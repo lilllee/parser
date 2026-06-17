@@ -6,22 +6,30 @@ import {
   ocrImageBuffer,
   ocrPdfBuffer,
   ocrSelectedPdfPages,
+  hasBrokenTable,
+  toSafeImageUrl,
 } from "./vllm.js";
-import { resolveAiConfig, withAiConfig, aiEnabled } from "./ai.js";
+import { resolveAiConfig, withAiConfig, aiEnabled, aiVisionEnabled } from "./ai.js";
 import { detectMangledPages } from "./detect.js";
 import { postprocessMarkdown } from "./postprocess.js";
 import { collectInvisibleText, stripInvisibleFromBlocks } from "./invisible.js";
+import { detectBoundaryIssues } from "../tests/quality.mjs";
 
 export async function runConvert(arrayBuffer, filename, sink = {}, aiConfig = resolveAiConfig()) {
   // 요청별 AI 설정을 컨텍스트에 깔아 내부 aiComplete 들이 같은 provider 를 쓰게 한다(ALS).
-  return withAiConfig(aiConfig, () => _runConvert(arrayBuffer, filename, sink, aiEnabled(aiConfig)));
+  return withAiConfig(aiConfig, () =>
+    _runConvert(arrayBuffer, filename, sink, aiEnabled(aiConfig), aiVisionEnabled(aiConfig))
+  );
 }
 
 // enabled: 이 변환에서 AI(OCR/enrich)를 쓸 수 있는지 — 요청 provider 기준.
-async function _runConvert(arrayBuffer, filename, sink, enabled) {
+// vision: 이미지(vision) 호출을 써도 되는지 — claude-cli 텍스트 전용 모드면 false (aiVisionEnabled).
+async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) {
   const onProgress = sink.onProgress || (() => {});
   const onPhase = sink.onPhase || (() => {});
   const onWarning = sink.onWarning || (() => {});
+  // vision 단계(이미지 OCR·스캔본·reflow·이미지/차트 enrich)를 탈지 여부.
+  const visionOk = enabled && vision;
 
   // ── 이미지 파일(PNG/JPG 등) → AI vision OCR 직행 (kordoc 우회) ──────────────
   const imageMime = imageMimeFromName(filename);
@@ -31,9 +39,29 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
       err.code = "AI_REQUIRED";
       throw err;
     }
+    if (!vision) {
+      const err = new Error(
+        "이미지 파일 OCR 에는 vision provider 가 필요합니다 — claude-cli 는 텍스트 전용 모드입니다. " +
+          "vllm/bedrock/anthropic 를 쓰거나 CLAUDE_CLI_VISION=1 로 켜세요."
+      );
+      err.code = "VISION_REQUIRED";
+      throw err;
+    }
     onPhase({ phase: "ocr", message: "이미지 vision OCR" });
     const md = await ocrImageBuffer(arrayBuffer, imageMime);
-    const cleaned = postprocessMarkdown(md || "");
+    let cleaned = postprocessMarkdown(md || "");
+    // OCR 은 전사만 하므로 차트/그림 해설은 enrich(page-visual)가 담당 — 이미지 자체를 입력으로 공급.
+    try {
+      const imageUrl = await toSafeImageUrl(arrayBuffer, imageMime);
+      const er = await enrichMarkdown(cleaned, [], {
+        visualPages: [{ page: 1, image: imageUrl, blocks: [{ content: cleaned }] }],
+        onNote: (note) => onPhase({ phase: "enrich", message: note }),
+      });
+      cleaned = er.markdown;
+    } catch (e) {
+      console.warn("[convert] 이미지 enrich 실패:", e?.message || e);
+    }
+    for (const w of detectBoundaryIssues(cleaned, filename).warnings) onWarning(w);
     onProgress({ progress: 1 });
     console.log(`[convert] ${filename} 완료 · 이미지 OCR · md ${cleaned.length}자`);
     return { markdown: cleaned, metadata: { source: "image-ocr", mimeType: imageMime }, pageCount: 1 };
@@ -60,6 +88,8 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
   // 3.0+ 는 success:true + isImageBased:true + 빈 markdown + warnings[NEEDS_OCR] 로 바뀌었다.
   // (CHANGELOG 3.0.0 "NEEDS_OCR 경고 정식화") 둘 다 잡지 않으면 빈 결과가 그대로 나간다.
   let ocrInfo = null;
+  // page-visual enrich 입력(차트/그림 해설용). 스캔본 OCR 경로에서만 채워진다.
+  let visualPages = [];
   const isImageBasedPdf =
     (!result.success && result.code === "IMAGE_BASED_PDF") ||
     (result.fileType === "pdf" && result.isImageBased === true && !(result.blocks || []).length);
@@ -68,7 +98,15 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
     err.code = "IMAGE_BASED_PDF";
     throw err;
   }
-  if (isImageBasedPdf && enabled) {
+  if (isImageBasedPdf && enabled && !vision) {
+    const err = new Error(
+      "이미지 기반 PDF (텍스트 레이어 없음) OCR 에는 vision provider 가 필요합니다 — " +
+        "claude-cli 텍스트 전용 모드. vllm/bedrock 사용 또는 CLAUDE_CLI_VISION=1."
+    );
+    err.code = "VISION_REQUIRED";
+    throw err;
+  }
+  if (isImageBasedPdf && visionOk) {
     onPhase({ phase: "ocr", message: "텍스트 레이어 없음 — vLLM vision OCR 진입" });
     const r = await ocrPdfBuffer(rawBackup, {
       onPage: (i, total) =>
@@ -80,6 +118,7 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
       `[ocr-fallback] ${filename} · ${r.ocrPages}/${r.pageCount} 페이지 인식`
     );
     ocrInfo = { pages: r.pageCount, recognized: r.ocrPages };
+    visualPages = r.visualPages || [];
 
     result = {
       success: true,
@@ -122,9 +161,18 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
     }
   }
 
+  // 텍스트 전용 모드(claude-cli 등): vision 재추출/이미지·차트 분석을 건너뜀을 알린다.
+  // 깨진 레이아웃·차트 페이지는 kordoc 출력 그대로 유지된다(품질 저하 가능 — 의도된 트레이드오프).
+  if (enabled && !vision && result.fileType === "pdf") {
+    onWarning({
+      message: "텍스트 전용 모드 — vision 재추출·이미지/차트 분석을 건너뜁니다 (kordoc 출력 유지). vision 을 켜려면 CLAUDE_CLI_VISION=1.",
+      code: "TEXT_ONLY_MODE",
+    });
+  }
+
   // 망가진/펼침면 페이지만 골라 vision OCR 로 재추출해 교체 (reflow).
   let reflowInfo = null;
-  if (enabled && !ocrInfo && result.fileType === "pdf" && (result.blocks || []).length) {
+  if (visionOk && !ocrInfo && result.fileType === "pdf" && (result.blocks || []).length) {
     // kordoc 는 PDF 페이지 수를 metadata.pageCount 에 넣으므로 fallback — 안 하면 0 이 전달돼
     // detectLowDensityPages(블록 0개인 빈 페이지 감지)가 무력화된다.
     const pageCount = result.pageCount ?? result.metadata?.pageCount ?? 0;
@@ -142,18 +190,64 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
     } catch (e) {
       console.warn("[spread] detect failed:", e?.message || e);
     }
-    const targets = [...new Set([...mangled, ...spreadPages])].sort((a, b) => a - b);
+    // kordoc 가 이미 유효한 병합표(colspan/rowspan + 안 깨짐)를 만든 '표 위주' 페이지는 vision OCR 로
+    // 개선되기보다 깨질 확률이 높다(예: 24열 보육료 그리드 — 일반 VLM 으로 재현 불가). 헛도는 재시도·
+    // 토큰 잘림을 막고 kordoc + postprocess(과분할 표 정규화)를 신뢰해 reflow 대상에서 제외한다.
+    // 펼침면(좌우 분할)과 본문이 충분한(prose 많은) 페이지는 면제 — 표만 보고 텍스트 보정을 건너뛰지 않게.
+    const blocksByPage = new Map();
+    for (const b of result.blocks || []) {
+      if (!blocksByPage.has(b.pageNumber)) blocksByPage.set(b.pageNumber, []);
+      blocksByPage.get(b.pageNumber).push(b);
+    }
+    const mangledForOcr = mangled.filter((pn) => {
+      if (spreadPages.has(pn)) return true;
+      const blks = blocksByPage.get(pn) || [];
+      const maxCols = Math.max(0, ...blks.filter((b) => b.type === "table").map((b) => b.table?.cols || 0));
+      const pmd = blocksToMarkdown(blks);
+      // 매우 넓은 병합 그리드(예: 24열 보육료표)는 일반 VLM 이 열 수를 일관되게 재현하지 못해 vision
+      // 으로 보내봐야 깨지고 kordoc 으로 되돌아온다 → kordoc 이 구조는 맞게 떴으면(안 깨짐) vision 을
+      // 생략하고 kordoc+postprocess(과분할 정규화)를 신뢰. 단 좁은 표는 vision 이 레이아웃 산산조각
+      // (예: 4열 비교표가 줄 단위로 흩어진 페이지)을 재구성할 수 있으므로 생략하지 않는다.
+      if (maxCols >= 10 && !hasBrokenTable(pmd)) {
+        console.log(`[reflow] p${pn} 광폭(${maxCols}열) 병합표 — vision 생략(kordoc+postprocess 신뢰)`);
+        return false;
+      }
+      return true;
+    });
+    const targets = [...new Set([...mangledForOcr, ...spreadPages])].sort((a, b) => a - b);
     if (targets.length) {
       onPhase({
         phase: "ocr",
-        message: `vision 재추출 ${targets.length}p (펼침면 ${spreadPages.size} · 레이아웃 ${mangled.length})`,
+        message: `vision 재추출 ${targets.length}p (펼침면 ${spreadPages.size} · 레이아웃 ${mangledForOcr.length})`,
       });
+      // kordoc 가 각 대상 페이지에서 본 '실제 표(2x2 이상)' 개수 — vision 이 표를 빠뜨리면
+      // (개수 부족) 재시도하게 한다. 펼침면은 좌우로 나뉘므로 개수 비교가 부정확해 제외.
+      const expectedTables = new Map();
+      const targetSet = new Set(targets);
+      for (const b of result.blocks || []) {
+        if (b.type !== "table" || !targetSet.has(b.pageNumber) || spreadPages.has(b.pageNumber)) continue;
+        if ((b.table?.rows || 0) >= 2 && (b.table?.cols || 0) >= 2) {
+          expectedTables.set(b.pageNumber, (expectedTables.get(b.pageNumber) || 0) + 1);
+        }
+      }
       try {
         const texts = await ocrSelectedPdfPages(rawBackup.slice(0), targets, {
           spreadPages,
+          expectedTables,
           onPage: (i, total, pn) =>
             onPhase({ phase: "ocr", message: `vision 재추출 ${i}/${total} (p${pn})` }),
         });
+        // 재시도까지 했는데도 표가 깨진(병합/중첩 표를 markdown 으로 누른) 페이지는, kordoc 가
+        // 그 페이지에 블록(보통 유효 HTML 표)을 갖고 있으면 reflow 하지 않고 kordoc 출력을 유지한다
+        // — 깨진 vision 표가 멀쩡한 kordoc 표를 덮어쓰는 것 방지. (kordoc 가 빈 페이지였다면 그래도
+        // vision 결과가 유일한 출력이므로 유지.)
+        const kordocPages = new Set((result.blocks || []).map((b) => b.pageNumber));
+        for (const [pn, txt] of [...texts]) {
+          if (hasBrokenTable(txt) && kordocPages.has(pn)) {
+            texts.delete(pn);
+            console.warn(`[reflow] p${pn} 표 깨짐 지속 — kordoc 출력 유지(vision 폐기)`);
+          }
+        }
         if (texts.size) {
           result.blocks = reflowBlocksWithOcr(result.blocks, texts);
           result.markdown = blocksToMarkdown(result.blocks);
@@ -181,7 +275,8 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
     const r = await enrichMarkdown(cleaned, result.images || [], {
       onProgress: (p) => onProgress({ phase: "enrich", progress: 0.5 + p * 0.5 }),
       onNote: (note) => onPhase({ phase: "enrich", message: note }),
-      visualPages: [],
+      visualPages, // 스캔본 OCR 시 캡처한 차트/그림 페이지 이미지(전사 후 해설 담당).
+      vision, // 텍스트 전용 모드면 이미지/차트 target 은 건너뛰고 표 텍스트 분석만.
     });
     cleaned = r.markdown;
     enrichStats = {
@@ -191,6 +286,9 @@ async function _runConvert(arrayBuffer, filename, sink, enabled) {
       total: r.total,
     };
   }
+
+  // 청크 경계 완전성 경고(조사/표/조문 미완, 페이지 구간 파일명) — 변환 실패는 아니지만 표면화.
+  for (const w of detectBoundaryIssues(cleaned, filename).warnings) onWarning(w);
 
   onProgress({ progress: 1 });
 
