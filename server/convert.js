@@ -199,40 +199,66 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
       if (!blocksByPage.has(b.pageNumber)) blocksByPage.set(b.pageNumber, []);
       blocksByPage.get(b.pageNumber).push(b);
     }
+    // 펼침면 분할(vision)은 '텍스트 레이어가 없는' 스캔 펼침면이나 구조가 깨진 경우에만 적용한다.
+    // 텍스트 레이어가 있는 펼침면(예: 포켓북)은 kordoc 텍스트가 RAG 에 더 정확하고(숫자·용어 오독 없음),
+    // 좌우 컬럼 병합 같은 읽기순서 흐트러짐은 다운스트림 AI 분석이 복구 가능하다. 반면 vision 분할은
+    // 숫자·이름 오독을 유입해 복구 불가한 사실 오류를 낸다 → 텍스트 레이어가 있으면 kordoc 우선.
+    const pageTextLen = (pn) =>
+      (blocksByPage.get(pn) || []).reduce((s, b) => s + String(b.content || b.text || "").length, 0);
+    const TEXT_LAYER_MIN = Number(process.env.VLLM_SPREAD_TEXT_MIN ?? 80);
+    const spreadForOcr = new Set(
+      [...spreadPages].filter((pn) => {
+        if (pageTextLen(pn) < TEXT_LAYER_MIN) return true; // 스캔 펼침면 — 텍스트 없음 → 분할 필요
+        const pmd = blocksToMarkdown(blocksByPage.get(pn) || []);
+        if (hasBrokenTable(pmd) || emptyCellRatio(pmd) >= 0.35) return true; // 텍스트 있어도 구조 붕괴면 분할
+        console.log(`[reflow] p${pn} 펼침면+텍스트레이어 양호 — vision 분할 생략(kordoc 텍스트 유지)`);
+        return false;
+      })
+    );
     const mangledForOcr = mangled.filter((pn) => {
-      if (spreadPages.has(pn)) return true;
+      if (spreadPages.has(pn)) return spreadForOcr.has(pn); // 펼침면은 텍스트레이어/구조에 따라 결정
       const blks = blocksByPage.get(pn) || [];
       const maxCols = Math.max(0, ...blks.filter((b) => b.type === "table").map((b) => b.table?.cols || 0));
       const pmd = blocksToMarkdown(blks);
+      const broken = hasBrokenTable(pmd);
       // 매우 넓은 병합 그리드(예: 24열 보육료표)는 일반 VLM 이 열 수를 일관되게 재현하지 못해 vision
-      // 으로 보내봐야 깨지고 kordoc 으로 되돌아온다 → kordoc 이 구조는 맞게 떴으면(안 깨짐) vision 을
-      // 생략하고 kordoc+postprocess(과분할 정규화)를 신뢰. 단 좁은 표는 vision 이 레이아웃 산산조각
-      // (예: 4열 비교표가 줄 단위로 흩어진 페이지)을 재구성할 수 있으므로 생략하지 않는다.
-      if (maxCols >= 10 && !hasBrokenTable(pmd)) {
+      // 으로 보내봐야 깨지고 kordoc 으로 되돌아온다 → 안 깨졌으면 vision 생략, kordoc+postprocess 신뢰.
+      if (maxCols >= 10 && !broken) {
         console.log(`[reflow] p${pn} 광폭(${maxCols}열) 병합표 — vision 생략(kordoc+postprocess 신뢰)`);
+        return false;
+      }
+      // vision reflow 는 텍스트 레이어의 한글 띄어쓰기·숫자를 오히려 망친다(실측: reflow PDF recall
+      // 91~95% vs 스킵 99%). 그래서 kordoc 출력이 '실제로 결함'일 때만 reflow 한다: 표 깨짐 /
+      // 산산조각(빈 셀 과다) / 한글 무공백 뭉침. 그 외 깨끗한 페이지는 detectMangledPages 가
+      // 잡았더라도 kordoc 텍스트를 유지(오탐 — vision 이 오히려 충실도를 낮춤).
+      // 참고: 값 뭉침(crammed)처럼 '구조만' 나쁜 표는 여기서 스킵되어 vision 교정을 받지 못한다.
+      // 내용 보존을 우선한 트레이드오프이며, 필요 시 이 게이트를 완화한다.
+      const deficient = broken || emptyCellRatio(pmd) >= 0.35 || NOSPACE_RUN.test(pmd);
+      if (!deficient) {
+        console.log(`[reflow] p${pn} kordoc 출력 양호 — vision 생략(텍스트 충실도 보존)`);
         return false;
       }
       return true;
     });
-    const targets = [...new Set([...mangledForOcr, ...spreadPages])].sort((a, b) => a - b);
+    const targets = [...new Set([...mangledForOcr, ...spreadForOcr])].sort((a, b) => a - b);
     if (targets.length) {
       onPhase({
         phase: "ocr",
-        message: `vision 재추출 ${targets.length}p (펼침면 ${spreadPages.size} · 레이아웃 ${mangledForOcr.length})`,
+        message: `vision 재추출 ${targets.length}p (펼침면 ${spreadForOcr.size}/${spreadPages.size} · 레이아웃 ${mangledForOcr.length})`,
       });
       // kordoc 가 각 대상 페이지에서 본 '실제 표(2x2 이상)' 개수 — vision 이 표를 빠뜨리면
       // (개수 부족) 재시도하게 한다. 펼침면은 좌우로 나뉘므로 개수 비교가 부정확해 제외.
       const expectedTables = new Map();
       const targetSet = new Set(targets);
       for (const b of result.blocks || []) {
-        if (b.type !== "table" || !targetSet.has(b.pageNumber) || spreadPages.has(b.pageNumber)) continue;
+        if (b.type !== "table" || !targetSet.has(b.pageNumber) || spreadForOcr.has(b.pageNumber)) continue;
         if ((b.table?.rows || 0) >= 2 && (b.table?.cols || 0) >= 2) {
           expectedTables.set(b.pageNumber, (expectedTables.get(b.pageNumber) || 0) + 1);
         }
       }
       try {
         const texts = await ocrSelectedPdfPages(rawBackup.slice(0), targets, {
-          spreadPages,
+          spreadPages: spreadForOcr,
           expectedTables,
           onPage: (i, total, pn) =>
             onPhase({ phase: "ocr", message: `vision 재추출 ${i}/${total} (p${pn})` }),
@@ -339,6 +365,24 @@ export function reflowBlocksWithOcr(blocks, texts) {
     }
   }
   return out;
+}
+
+// kordoc 페이지 출력이 '실제로 결함'인지 판정 — reflow(vision 재추출) 가치가 있는 페이지만 거른다.
+// vision 은 텍스트 레이어의 한글 띄어쓰기·숫자를 오히려 망치므로(실측: reflow PDF recall 91~95%
+// vs 스킵 99%), 깨끗한 페이지는 kordoc 텍스트를 유지하는 편이 매칭율이 높다.
+const NOSPACE_RUN = /[가-힣][가-힣,()·]{24,}/; // 한글 무공백 뭉침(kordoc 띄어쓰기 소실)
+function emptyCellRatio(md) {
+  const tdTotal = (md.match(/<td\b[^>]*>/gi) || []).length;
+  const tdEmpty = (md.match(/<td\b[^>]*>\s*<\/td>/gi) || []).length;
+  let pipeTotal = 0, pipeEmpty = 0;
+  for (const line of String(md).split("\n")) {
+    if (!/^\s*\|.*\|\s*$/.test(line) || /^\s*\|?\s*:?-{2,}/.test(line)) continue; // 데이터행만(구분행 제외)
+    const cells = line.split("|").slice(1, -1);
+    pipeTotal += cells.length;
+    pipeEmpty += cells.filter((c) => !c.trim()).length;
+  }
+  const total = tdTotal + pipeTotal;
+  return total ? (tdEmpty + pipeEmpty) / total : 0;
 }
 
 function unionBbox(a, b) {
