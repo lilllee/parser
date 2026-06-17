@@ -28,6 +28,21 @@ const recall = (src, out) => {
   for (const t of src) if (out.has(t)) hit++;
   return hit / src.size;
 };
+// 구조 지표 — recall(내용)만으론 못 잡는 결함: kordoc 이 목차·산문을 표로 깨뜨린 '가짜 표' 잔존 수.
+// 좁은 표(<=6열) 중 빈 셀 >=50% 또는 1~6셀에 <br>>=8 (진짜 병합 그리드·데이터 표는 제외).
+function fakeTableCount(md) {
+  let n = 0;
+  for (const t of String(md).match(/<table[\s\S]*?<\/table>/gi) || []) {
+    const rows = t.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
+    let mc = 0;
+    for (const rw of rows) { let c = 0; for (const cl of rw.match(/<t[dh][^>]*>/gi) || []) { const m = cl.match(/colspan\s*=\s*["']?(\d+)/i); c += m ? +m[1] : 1; } mc = Math.max(mc, c); }
+    const cs = (t.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) || []).length;
+    const e = (t.match(/<t[dh][^>]*>\s*<\/t[dh]>/gi) || []).length;
+    const br = (t.match(/<br/gi) || []).length;
+    if (mc <= 6 && ((cs && e / cs >= 0.5) || (cs <= 6 && br >= 8))) n++;
+  }
+  return n;
+}
 
 console.log(`[fidelity] dir=${dir} files=${files.length}\n`);
 for (const f of files) {
@@ -45,7 +60,8 @@ for (const f of files) {
   const src = tokens(srcMd), out = tokens(outMd);
   const r = recall(src, out);
   const dropped = [...src].filter((t) => !out.has(t));
-  const mark = r >= 0.97 ? "🟢" : r >= 0.9 ? "🟡" : "🔴";
-  console.log(`${mark} ${f}  recall ${(r * 100).toFixed(1)}% (원문 ${src.size}토큰 중 누락 ${dropped.length})`);
+  const fake = fakeTableCount(outMd);
+  const mark = r >= 0.97 && fake === 0 ? "🟢" : r >= 0.9 ? "🟡" : "🔴";
+  console.log(`${mark} ${f}  recall ${(r * 100).toFixed(1)}% (원문 ${src.size}토큰 중 누락 ${dropped.length}) · 구조결함(가짜표) ${fake}`);
   if (dropped.length) console.log(`     누락 예: ${dropped.slice(0, 25).join(" ")}`);
 }

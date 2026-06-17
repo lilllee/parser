@@ -81,6 +81,9 @@ export function postprocessMarkdown(md) {
   // kordoc 이 '번호 박스 + 제목' 섹션 머리글을 데이터 없는 표로 떠오는 아티팩트 → ## 헤딩 승격.
   out = liftSectionHeadingTables(out);
 
+  // kordoc 이 목차·머리말·산문을 '가짜 표'로 만든 경우 평문으로 펴서 복원(텍스트 정확도 보존).
+  out = flattenFakeTables(out);
+
   // 빈 대괄호 잔재 라인 제거 (예: "[][]M").
   out = out.replace(/^[ \t]*(?:\[\][ \t]*)+[A-Za-z]?[ \t]*$/gm, "");
 
@@ -305,6 +308,77 @@ function sectionHeadingFromBlock(block) {
   if (!/[가-힣A-Za-z]/.test(title) || SECTION_MARKER_RE.test(title)) return null; // 제목은 실제 텍스트
   const sep = ROMAN_OR_NUM_RE.test(marker) ? `${marker}.` : marker;
   return `## ${sep} ${title}`;
+}
+
+// kordoc 이 목차·머리말·산문 등 비-표 내용을 '가짜 표'로 만든 경우를 감지해 평문으로 편다.
+// 진짜 표(보육료 24열 병합 그리드, 현행/개정 비교표 등)는 절대 건드리지 않도록 보수적으로 판정:
+//   좁은 표(maxCols<=6) 중 → (a) 셀<=6 개에 <br>>=8 (목차/문단을 몇 셀에 욱여넣음) 또는
+//   (b) 행 3+ 인데 통째로 빈 열 존재(산문이 빈 격자로 흩어짐) 일 때만 flatten.
+// flatten: 각 행의 비어있지 않은 셀을 공백으로 잇고 셀 내부 <br> 는 줄로 분리 — kordoc 텍스트 보존.
+const FAKE_TABLE_MAX_COLS = 6;
+function rowsAreFakeTable(rows, brCount) {
+  const cellCount = rows.reduce((s, r) => s + r.length, 0);
+  const maxCols = rows.reduce((m, r) => Math.max(m, r.length), 0);
+  if (maxCols === 0 || maxCols > FAKE_TABLE_MAX_COLS) return false;
+  if (cellCount <= 6 && brCount >= 8) return true; // 목차류: 페이지를 몇 셀에 <br> 로 욱여넣음
+  // 매우 성긴 격자(빈 셀 >=50%): 불릿/산문이 표로 흩어진 것. 진짜 병합표(보육료)는 maxCols>6 로 이미
+  // 제외됐고, 0.4 대 빈셀률의 진짜 표·폼(구분|금액, 신청서 등)은 임계 아래라 보존된다.
+  const emptyCells = rows.reduce((s, r) => s + r.filter((c) => !c?.trim()).length, 0);
+  if (cellCount >= 6 && emptyCells / cellCount >= 0.5) return true;
+  if (rows.length >= 3) {
+    const width = maxCols;
+    for (let c = 0; c < width; c++) {
+      const present = rows.filter((r) => c < r.length);
+      if (present.length >= 3 && present.every((r) => !r[c]?.trim())) return true; // 통째 빈 열
+    }
+  }
+  return false;
+}
+function flattenRows(rows) {
+  const lines = [];
+  for (const r of rows) {
+    const joined = r.map((c) => String(c || "").trim()).filter(Boolean).join(" ");
+    for (const ln of joined.split("\n").map((x) => x.trim()).filter(Boolean)) lines.push(ln);
+  }
+  return lines.join("\n");
+}
+function htmlTableRows(tableMd) {
+  const rowMatches = tableMd.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
+  return rowMatches.map((row) =>
+    (row.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) || []).map((c) =>
+      c.replace(/<t[dh][^>]*>|<\/t[dh]>/gi, "").replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "").trim()
+    )
+  );
+}
+function flattenFakeTables(md) {
+  if (!md || (md.indexOf("|") === -1 && !/<table/i.test(md))) return md;
+  const lines = md.split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (/<table\b/i.test(lines[i])) {
+      const block = [];
+      let depth = 0;
+      do {
+        depth += (lines[i].match(/<table\b/gi) || []).length - (lines[i].match(/<\/table>/gi) || []).length;
+        block.push(lines[i]); i++;
+      } while (i < lines.length && depth > 0);
+      const tbl = block.join("\n");
+      const rows = htmlTableRows(tbl);
+      out.push(rowsAreFakeTable(rows, (tbl.match(/<br\s*\/?>/gi) || []).length) ? flattenRows(rows) : tbl);
+      continue;
+    }
+    if (PIPE_ROW.test(lines[i])) {
+      const block = [];
+      while (i < lines.length && PIPE_ROW.test(lines[i])) { block.push(lines[i]); i++; }
+      const rows = block.filter((l) => !isSeparatorRow(l)).map(splitRow);
+      const brCount = (block.join("\n").match(/<br\s*\/?>/gi) || []).length;
+      out.push(rowsAreFakeTable(rows, brCount) ? flattenRows(rows) : block.join("\n"));
+      continue;
+    }
+    out.push(lines[i]); i++;
+  }
+  return out.join("\n");
 }
 
 function liftSectionHeadingTables(md) {
