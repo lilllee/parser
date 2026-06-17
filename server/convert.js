@@ -208,11 +208,15 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
     const TEXT_LAYER_MIN = Number(process.env.VLLM_SPREAD_TEXT_MIN ?? 80);
     const spreadForOcr = new Set(
       [...spreadPages].filter((pn) => {
-        if (pageTextLen(pn) < TEXT_LAYER_MIN) return true; // 스캔 펼침면 — 텍스트 없음 → 분할 필요
-        const pmd = blocksToMarkdown(blocksByPage.get(pn) || []);
-        if (hasBrokenTable(pmd) || emptyCellRatio(pmd) >= 0.35) return true; // 텍스트 있어도 구조 붕괴면 분할
-        console.log(`[reflow] p${pn} 펼침면+텍스트레이어 양호 — vision 분할 생략(kordoc 텍스트 유지)`);
-        return false;
+        // 텍스트 레이어가 있는 펼침면은 kordoc 텍스트(정확한 숫자·용어)를 유지한다 — 구조가 다소
+        // 흐트러져도(좌우 컬럼 병합 등) RAG 엔 vision 의 숫자/이름 오독보다 낫고, 읽기순서는
+        // 다운스트림 AI 분석이 복구한다. 텍스트 레이어가 없는(스캔) 펼침면만 vision 분할 OCR —
+        // 그 페이지는 kordoc 대안 자체가 없다.
+        if (pageTextLen(pn) >= TEXT_LAYER_MIN) {
+          console.log(`[reflow] p${pn} 펼침면+텍스트레이어 — vision 분할 생략(kordoc 텍스트 유지)`);
+          return false;
+        }
+        return true;
       })
     );
     const mangledForOcr = mangled.filter((pn) => {
