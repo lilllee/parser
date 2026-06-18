@@ -30,7 +30,7 @@
 | 실패 응답 | `{ ok:false, error, code, elapsedMs }` |
 
 흐름:
-
+[source.md](../../kordoc/output/source.md)
 ```text
 multipart 요청
   -> file arrayBuffer 추출

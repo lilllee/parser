@@ -19,11 +19,33 @@ export function scoreMarkdown(md) {
     return l.split("|").some((cell) => (cell.match(/\d{1,3}(?:,\d{3})+/g) || []).length >= 6);
   }).length;
 
-  // 3) 코드펜스 잔재 (모델이 ```markdown 으로 감쌈)
-  issues.codeFences = (md.match(/^[ \t]*```/gm) || []).length;
+  // 3) 코드펜스 잔재 (모델이 ```markdown 으로 감쌈) — 단, ```mermaid/graph 등 다이어그램 블록은
+  //    의도된 산출물(흐름도)이라 결함이 아니다. 다이어그램 블록의 여는/닫는 펜스 2개씩을 제외한다.
+  const allFences = (md.match(/^[ \t]*```/gm) || []).length;
+  const diagramBlocks = (md.match(/^[ \t]*```(?:mermaid|graph|flowchart|sequenceDiagram|gantt|classDiagram|stateDiagram|erDiagram|dot)\b/gim) || []).length;
+  issues.codeFences = Math.max(0, allFences - 2 * diagramBlocks);
 
-  // 4) 단독 페이지번호/푸터 줄
-  issues.strayPageNums = (md.match(/^[ \t]*-?\d{1,4}-?[ \t]*$/gm) || []).filter((l) => /\d/.test(l)).length;
+  // 4) 단독 페이지번호/푸터 줄. 단, 인접(이전/다음 비공백) 줄이 표 행이거나 또 다른 단독 숫자면
+  //    (차트값 군집 또는 깨진 표에서 튕겨나온 셀) 데이터로 보고 제외 — 진짜 고립 페이지번호만 센다.
+  const isBareNum = (l) => /^[ \t]*-?\d{1,4}-?[ \t]*$/.test(l) && /\d/.test(l);
+  const isTableish = (l) => /^[ \t]*(?:\||<\/?(?:table|tr|td|th)\b)/i.test(l);
+  let stray = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (!isBareNum(lines[i])) continue;
+    let prev = ""; for (let j = i - 1; j >= 0; j--) if (lines[j].trim()) { prev = lines[j]; break; }
+    let next = ""; for (let j = i + 1; j < lines.length; j++) if (lines[j].trim()) { next = lines[j]; break; }
+    if (!((prev && (isTableish(prev) || isBareNum(prev))) || (next && (isTableish(next) || isBareNum(next))))) stray++;
+  }
+  issues.strayPageNums = stray;
+
+  // 4b) 표 셀에 문장이 통째로 박힘 — 두 표가 한 페이지에서 하나의 <table> 로 뭉개지거나(인구동향
+  //     [표3]+[표4]), 비교표가 깨지며 산문이 셀로 들어간 신호. HTML 이 well-formed 라 기존 지표는
+  //     이를 0 으로 놓쳤다. 셀 텍스트가 한글 문장(종결/증감 표현)이거나 [그림/[표 캡션을 품으면 센다.
+  issues.sentenceInTableCell = (md.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) || []).filter((cell) => {
+    const text = cell.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (text.length < 30 || !/[가-힣]/.test(text)) return false;
+    return /(?:증가함|감소함|하였다|되었다|하였음|되었음|명으로|배 증가|배 감소)/.test(text) || /\[(?:그림|표)\s*\d/.test(text);
+  }).length;
 
   // 5) 빈/실패 마커
   issues.emptyMarkers = (md.match(/\[OCR 결과 없음\]|\[OCR\s*실패/g) || []).length;
@@ -44,7 +66,8 @@ export function scoreMarkdown(md) {
 
   const problemTotal =
     issues.brokenKoreanSpacing + issues.crammedTableRows + issues.codeFences +
-    issues.strayPageNums + issues.emptyMarkers + issues.bodyAsHeading;
+    issues.strayPageNums + issues.emptyMarkers + issues.bodyAsHeading +
+    issues.sentenceInTableCell;
 
   // 청크 경계 완전성 — 변환 결함(problemTotal)과 별개의 정보성 신호라 따로 둔다.
   const boundary = detectBoundaryIssues(md).flags;

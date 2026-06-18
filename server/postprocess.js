@@ -76,6 +76,11 @@ export function postprocessMarkdown(md) {
   // 예: "2<br>450m 이상" → "450㎡ 이상", "450m2" → "450㎡".
   out = normalizeSquareMeter(out);
 
+  // 전보용 월/시·사각/원katakana 기호(㋀-㋿, ㍘-㍰)가 장식 번호 대신 잘못 추출돼 본문에 섞이는
+  // 경우 제거(한국어 행정문서엔 정당한 용례 없음). 원문자 한글 목록마커(㉠-㉭, U+3260↓)와 단위
+  // 기호(㎡㎏…, U+3371↑)는 범위 밖이라 보존. 줄머리 불릿 글리프(•●◦∙)는 markdown '- ' 로 정규화.
+  out = normalizeStrayGlyphsAndBullets(out);
+
   out = normalizeKnownOversplitTables(out);
 
   // kordoc 이 '번호 박스 + 제목' 섹션 머리글을 데이터 없는 표로 떠오는 아티팩트 → ## 헤딩 승격.
@@ -131,6 +136,14 @@ export function postprocessMarkdown(md) {
   out = out.replace(/\s+$/, "") + "\n";
 
   return out;
+}
+
+// 전보 기호(㋀-㋿ U+32C0-32FF, ㍘-㍰ U+3358-3370) 제거 + 줄머리 불릿 글리프 → markdown '- '.
+// · (가운뎃점 U+00B7)은 한국어 나열 구분자(가·나·다)라 변환 대상에서 제외.
+function normalizeStrayGlyphsAndBullets(md) {
+  return String(md)
+    .replace(/[㋀-㋿㍘-㍰]/g, "")
+    .replace(/^([ \t]*)[•●◦∙][ \t]+/gm, "$1- ");
 }
 
 function normalizeSquareMeter(md) {
@@ -322,6 +335,9 @@ function sectionHeadingFromBlock(block) {
 // (이 문서 줄바꿈은 음절 중간 끊김이 다수라 공백 없이 잇는 편이 더 정확.) 종결문장·목록·표는 보존.
 const SENT_END = /[.!?。…:;」』”’)\]]\s*$|(?:다|요|죠|까|네|음|함|임|됨|니다|음\.|함\.)\s*$/;
 const CONT_MARKER = /^\s*(?:[#>|]|<|[-*∙·•]\s|[○◦●□■▪️※☞⚪◎]|[①-⑮㉠-㉭]|[0-9]+\s*[.)]\s|[가-하]\s*[.)]\s|\([0-9가-하]+\)|제\s*\d+\s*[장절조항관])/;
+// 번호/원문자 + [태그] 로 시작하는 '헤딩-라벨' 줄(예: "① [공통] …활동계획을 반영")은 줄바꿈된
+// 목록 항목이 아니라 라벨이므로 길어도 다음 줄을 흡수하지 않는다("반영"+"모든…" → "반영모든" 오병합 방지).
+const HEADING_LABEL = /^\s*(?:[①-⑮㉠-㉭]|\([0-9가-하]+\)|\d+\s*[.)]|[가-하]\s*[.)])\s*\[[^\]]+\]/;
 function reflowSoftWrappedParagraphs(md) {
   const paras = String(md).split(/\n{2,}/);
   const out = [];
@@ -332,6 +348,7 @@ function reflowSoftWrappedParagraphs(md) {
     // 보존한다. 연속줄은 한글뿐 아니라 숫자 시작도 허용("제"\n\n"32조의7" → "제32조의7").
     const prevMergeable =
       /[가-힣]$/.test(prev) && !SENT_END.test(prev) && prev.indexOf("\n") === -1 &&
+      !HEADING_LABEL.test(prev) &&
       (CONT_MARKER.test(prev) ? prev.length >= 30 : prev.length >= 15);
     if (
       t.trim() && prevMergeable &&
@@ -378,7 +395,22 @@ function flattenRows(rows) {
   return lines.join("\n");
 }
 function htmlTableRows(tableMd) {
-  const rowMatches = tableMd.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
+  // 중첩 표 해체: 셀 안에 안쪽 <table> 이 있으면 그 안쪽 <tr>/<th> 태그가 아래 lazy 정규식을
+  // 가로채(첫 </tr>·</th> 에서 끊김) 바깥 셀의 본문(<br> 로 이어진 목차 등)을 통째로 잃는다.
+  // 그래서 표가 하나만 남을 때까지 '가장 안쪽' 표를 텍스트(셀↔셀·행↔행은 <br>)로 풀어준다.
+  // 중첩이 없으면 while 미실행 — 일반 표에는 무해. (예: 2019 공모 목차가 <th> 안 중첩표였음)
+  let md = String(tableMd);
+  for (let guard = 0; (md.match(/<table\b/gi) || []).length > 1 && guard < 20; guard++) {
+    md = md.replace(/<table\b[^>]*>((?:(?!<table\b)[\s\S])*?)<\/table>/i, (_, inner) =>
+      inner
+        .replace(/<\/(?:tr|t[dh])>/gi, "<br>")
+        .replace(/<[^>]+>/g, "")
+        .replace(/(?:<br>\s*){2,}/gi, "<br>")
+        .replace(/^(?:<br>)+|(?:<br>)+$/g, "")
+        .trim()
+    );
+  }
+  const rowMatches = md.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
   return rowMatches.map((row) =>
     (row.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) || []).map((c) =>
       c.replace(/<t[dh][^>]*>|<\/t[dh]>/gi, "").replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "").trim()
