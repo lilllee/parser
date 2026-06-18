@@ -81,9 +81,6 @@ export function postprocessMarkdown(md) {
   // kordoc 이 '번호 박스 + 제목' 섹션 머리글을 데이터 없는 표로 떠오는 아티팩트 → ## 헤딩 승격.
   out = liftSectionHeadingTables(out);
 
-  // kordoc 이 목차·머리말·산문을 '가짜 표'로 만든 경우 평문으로 펴서 복원(텍스트 정확도 보존).
-  out = flattenFakeTables(out);
-
   // 빈 대괄호 잔재 라인 제거 (예: "[][]M").
   out = out.replace(/^[ \t]*(?:\[\][ \t]*)+[A-Za-z]?[ \t]*$/gm, "");
 
@@ -120,6 +117,11 @@ export function postprocessMarkdown(md) {
 
   // 페이지 경계로 끊긴 '같은 머리글' 파이프 표를 하나로 병합 (머리말·꼬리말 제거 후).
   out = mergeAdjacentPipeTables(out);
+
+  // kordoc 이 목차·머리말·산문을 '가짜 표'로 만든 경우 평문으로 편다(텍스트 정확도 보존).
+  // 반드시 페이지번호 제거(stripLonePageNumbers)·반복 꼬리말 제거(removeRunningHeadersFooters)
+  // '뒤'에 둔다 — 먼저 펴면 목차의 짧은 줄(항목·페이지번호)이 그 단계들에 삭제되어 내용이 누락된다.
+  out = flattenFakeTables(out);
 
   // 4) 과도한 빈 줄 축소 (3+ → 2) + 문서 앞뒤 공백 정리
   out = out.replace(/\n{3,}/g, "\n\n").replace(/^\s+/, "");
