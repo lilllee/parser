@@ -11,7 +11,7 @@ import {
 } from "./vllm.js";
 import { resolveAiConfig, withAiConfig, aiEnabled, aiVisionEnabled } from "./ai.js";
 import { detectMangledPages } from "./detect.js";
-import { postprocessMarkdown, hasCrammedTable } from "./postprocess.js";
+import { postprocessMarkdown, hasCrammedTable, looksLikeTocTable } from "./postprocess.js";
 import { collectInvisibleText, stripInvisibleFromBlocks } from "./invisible.js";
 import { detectBoundaryIssues } from "../tests/quality.mjs";
 
@@ -199,12 +199,14 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
       if (!blocksByPage.has(b.pageNumber)) blocksByPage.set(b.pageNumber, []);
       blocksByPage.get(b.pageNumber).push(b);
     }
-    // kordoc 이 2D 레이아웃(목차 등)을 '크램드 표'(몇 셀에 <br> 로 뭉갬)로 떠와 행 정렬을 잃은 페이지는
-    // detectMangledPages 가 못 잡지만 vision 이 2D 구조(라벨↔제목↔페이지 정렬)를 복원한다 → reflow
-    // 대상에 추가. (이런 페이지의 올바른 출력은 표가 아니라 리스트이므로 아래 expectedTables 에서 제외.)
+    // kordoc 이 2D 레이아웃(목차 등)을 망친 페이지: '크램드 표'(몇 셀에 <br> 로 뭉갬) 또는 목차가
+    // 표로 떠져 제목이 컬럼에 쪼개진 것. detectMangledPages 가 잡아도 게이트가 '결함 아님'으로 스킵하나,
+    // vision 이 2D 구조(라벨↔제목↔페이지 정렬)를 복원하므로 reflow 대상에 추가한다. (올바른 출력은
+    // 표가 아니라 리스트이므로 아래 expectedTables 에서 제외.)
     const crammedPages = new Set();
     for (const [pn, blks] of blocksByPage) {
-      if (hasCrammedTable(blocksToMarkdown(blks))) crammedPages.add(pn);
+      const pmd = blocksToMarkdown(blks);
+      if (hasCrammedTable(pmd) || looksLikeTocTable(pmd)) crammedPages.add(pn);
     }
     for (const pn of crammedPages) if (!mangled.includes(pn)) mangled.push(pn);
     mangled.sort((a, b) => a - b);

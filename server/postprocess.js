@@ -397,6 +397,28 @@ export function hasCrammedTable(md) {
   return false;
 }
 
+// 목차가 표(파이프/HTML)로 잘못 떠진 경우 감지: 데이터 행의 절반 이상이 'N-N(또는 제N장) … 페이지번호'
+// 패턴이면 TOC 표로 본다. 제목이 컬럼에 쪼개진 파이프 목차(크램드 HTML 이 아닌)도 잡아 vision 라우팅.
+// 진짜 데이터 표는 '섹션라벨 … 단독 페이지번호' 행이 드물어 안 걸린다. (export)
+export function looksLikeTocTable(md) {
+  const rows = [];
+  for (const line of String(md).split("\n")) {
+    const t = line.trim();
+    if (/^\|.*\|$/.test(t) && !/^\|?\s*:?-{2,}/.test(t)) rows.push(t.replace(/^\||\|$/g, "").split("|").map((c) => c.trim()));
+  }
+  for (const tr of String(md).match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || []) {
+    rows.push((tr.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) || []).map((c) => c.replace(/<br\s*\/?>/gi, " ").replace(/<[^>]+>/g, "").trim()));
+  }
+  if (rows.length < 4) return false;
+  let toc = 0;
+  for (const cells of rows) {
+    const ne = cells.filter(Boolean);
+    if (ne.length < 2) continue;
+    if (/^(?:\d+-\d+|제\s*\d+\s*장)\b/.test(ne[0]) && /^\d{1,3}$/.test(ne[ne.length - 1])) toc++;
+  }
+  return toc >= rows.length * 0.5;
+}
+
 function flattenFakeTables(md) {
   if (!md || (md.indexOf("|") === -1 && !/<table/i.test(md))) return md;
   const lines = md.split("\n");
