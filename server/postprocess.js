@@ -429,6 +429,31 @@ export function hasCrammedTable(md) {
   return false;
 }
 
+// kordoc 레이아웃 분석이 '표+산문+다른 표'를 한 격자로 뭉갠 '문장 박힌 표' 감지: 표 셀에 문장
+// 길이의 한글(증감 종결어·"…명으로") 또는 [그림 N]·[표 N] 캡션이 들어있으면 결함으로 본다.
+// hasBrokenTable(형식 깨짐)·hasCrammedTable(셀<=6·br다수)이 못 잡는, '형식은 멀쩡하나 의미상
+// 깨진' 표(예: 인구동향 두 표/페이지가 한 <table>로)를 reflow(vision) 대상으로 라우팅하는 데 쓴다.
+const TABLE_CELL_RE = /<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi;
+const SENTENCE_IN_CELL = /(?:증가함|감소함|하였다|되었다|하였음|되었음|명으로|배\s*증가|배\s*감소)/;
+function cellIsStuffed(t) {
+  if (!/[가-힣]/.test(t)) return false;
+  // [그림 N]·[표 N] 캡션이 셀에 들어간 건 길이와 무관하게 결함(캡션은 표 밖이어야 함).
+  if (/\[(?:그림|표)\s*\d/.test(t)) return true;
+  // 문장(증감 종결어·"…명으로")이 셀에 박힌 건 길이 가드와 함께(정상 짧은 라벨 오탐 방지).
+  return t.length >= 30 && SENTENCE_IN_CELL.test(t);
+}
+export function hasSentenceStuffedTable(md) {
+  const s = String(md);
+  for (const cell of s.match(TABLE_CELL_RE) || []) {
+    if (cellIsStuffed(cell.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim())) return true;
+  }
+  for (const line of s.split("\n")) {
+    if (!/^\s*\|.*\|/.test(line) || isSeparatorRow(line)) continue;
+    for (const cell of line.split("|")) if (cellIsStuffed(cell.trim())) return true;
+  }
+  return false;
+}
+
 // 목차가 표(파이프/HTML)로 잘못 떠진 경우 감지: 데이터 행의 절반 이상이 'N-N(또는 제N장) … 페이지번호'
 // 패턴이면 TOC 표로 본다. 제목이 컬럼에 쪼개진 파이프 목차(크램드 HTML 이 아닌)도 잡아 vision 라우팅.
 // 진짜 데이터 표는 '섹션라벨 … 단독 페이지번호' 행이 드물어 안 걸린다. (export)
