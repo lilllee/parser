@@ -298,17 +298,17 @@ async function analyzeTarget(t, imageMap) {
   return null;
 }
 
-// 추출(OCR) 호출용 샘플링. 전사 충실도를 위해 저온(temp 0.1)을 쓴다 — 낮을수록 결정적이라
-// 같은 토큰(<br>·개행)을 무한 반복하는 degeneration 위험이 있지만, 이는 repetition_penalty(등장
-// 토큰에 '일정' 페널티)가 막는다 — temp 0.1 + rep 1.1 조합은 degeneration 없음을 실측 확인.
-// rep 은 횟수 비례가 아니라, 현행/개정처럼 내용이 길게 반복되는 비교 문서에서 단어 치환
-// 드리프트를 일으키지 않는다. (frequency_penalty 는 횟수 비례라 반복 문서에서 드리프트 →
-// 기본 0. presence_penalty 도 전사 충실도 저해 우려로 0.) 모두 env 로 모델별 튜닝 가능.
+// 추출(OCR) 호출용 샘플링. 순수 greedy(temp 0) — 전사·숫자 충실도 최고이자 '결정적'(같은
+// 페이지 = 같은 출력)이라 회귀 측정 노이즈가 사라진다. 과거 구모델(Qwen3)은 빈 영역에서 <br>·개행
+// 무한반복(degeneration)이 있어 temp 0.1 + repetition_penalty 1.1 로 막았으나, qwen3.6-27b 은
+// degeneration 없음을 실측 확인(희소 표·극단 여백 합성·표지/서식 13페이지 전부 finish=stop,
+// 극단 여백은 3자만 출력) → rep_penalty 불필요해 off(1.0). 모두 env 로 모델별 튜닝/복구 가능
+// (구모델로 회귀 시 VLLM_OCR_TEMPERATURE=0.1, VLLM_OCR_REPETITION_PENALTY=1.1 로 되돌린다).
 const OCR_SAMPLING = Object.freeze({
-  temperature: Number(process.env.VLLM_OCR_TEMPERATURE ?? 0.1),
+  temperature: Number(process.env.VLLM_OCR_TEMPERATURE ?? 0),
   topP: Number(process.env.VLLM_OCR_TOP_P ?? 1.0),
   presencePenalty: Number(process.env.VLLM_OCR_PRESENCE_PENALTY ?? 0),
-  repetitionPenalty: Number(process.env.VLLM_OCR_REPETITION_PENALTY ?? 1.1),
+  repetitionPenalty: Number(process.env.VLLM_OCR_REPETITION_PENALTY ?? 1.0),
   frequencyPenalty: Number(process.env.VLLM_OCR_FREQUENCY_PENALTY ?? 0),
 });
 

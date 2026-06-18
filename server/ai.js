@@ -75,8 +75,9 @@ export async function aiComplete({
   const ai = currentAiConfig();
   const { provider: p, cfg } = ai;
   if (!p.enabled(cfg)) return "";
-  // system 메시지는 vllm/openai(supportsSystem)만 별도 메시지로 보낸다 — 모든 요청에서
-  // byte 동일한 공통 지시문이 맨 앞에 오게 해 vLLM prefix cache 를 살린다.
+  // system 메시지는 vllm/openai(supportsSystem)만 별도 메시지로 보낸다 — 공통 지시문을 맨 앞에 둔다.
+  // (qwen3.6-27b 하이브리드 Mamba/GDN 은 prefix-cache 적중 ~0% 라 '캐시 이득'은 없다; 그래도 표준
+  //  형식이라 system 분리는 유지하되, 지시문 자체는 간결히 — 매 호출 재-prefill 되므로.)
   // 미지원 provider 는 기존 동작 보존을 위해 prompt 앞에 병합.
   let sys = system;
   let userPrompt = prompt;
