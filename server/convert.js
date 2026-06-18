@@ -11,7 +11,7 @@ import {
 } from "./vllm.js";
 import { resolveAiConfig, withAiConfig, aiEnabled, aiVisionEnabled } from "./ai.js";
 import { detectMangledPages } from "./detect.js";
-import { postprocessMarkdown } from "./postprocess.js";
+import { postprocessMarkdown, hasCrammedTable } from "./postprocess.js";
 import { collectInvisibleText, stripInvisibleFromBlocks } from "./invisible.js";
 import { detectBoundaryIssues } from "../tests/quality.mjs";
 
@@ -199,6 +199,16 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
       if (!blocksByPage.has(b.pageNumber)) blocksByPage.set(b.pageNumber, []);
       blocksByPage.get(b.pageNumber).push(b);
     }
+    // kordoc 이 2D 레이아웃(목차 등)을 '크램드 표'(몇 셀에 <br> 로 뭉갬)로 떠와 행 정렬을 잃은 페이지는
+    // detectMangledPages 가 못 잡지만 vision 이 2D 구조(라벨↔제목↔페이지 정렬)를 복원한다 → reflow
+    // 대상에 추가. (이런 페이지의 올바른 출력은 표가 아니라 리스트이므로 아래 expectedTables 에서 제외.)
+    const crammedPages = new Set();
+    for (const [pn, blks] of blocksByPage) {
+      if (hasCrammedTable(blocksToMarkdown(blks))) crammedPages.add(pn);
+    }
+    for (const pn of crammedPages) if (!mangled.includes(pn)) mangled.push(pn);
+    mangled.sort((a, b) => a - b);
+
     // 펼침면 분할(vision)은 '텍스트 레이어가 없는' 스캔 펼침면이나 구조가 깨진 경우에만 적용한다.
     // 텍스트 레이어가 있는 펼침면(예: 포켓북)은 kordoc 텍스트가 RAG 에 더 정확하고(숫자·용어 오독 없음),
     // 좌우 컬럼 병합 같은 읽기순서 흐트러짐은 다운스트림 AI 분석이 복구 가능하다. 반면 vision 분할은
@@ -237,7 +247,7 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
       // 잡았더라도 kordoc 텍스트를 유지(오탐 — vision 이 오히려 충실도를 낮춤).
       // 참고: 값 뭉침(crammed)처럼 '구조만' 나쁜 표는 여기서 스킵되어 vision 교정을 받지 못한다.
       // 내용 보존을 우선한 트레이드오프이며, 필요 시 이 게이트를 완화한다.
-      const deficient = broken || emptyCellRatio(pmd) >= 0.35 || NOSPACE_RUN.test(pmd);
+      const deficient = broken || emptyCellRatio(pmd) >= 0.35 || NOSPACE_RUN.test(pmd) || crammedPages.has(pn);
       if (!deficient) {
         console.log(`[reflow] p${pn} kordoc 출력 양호 — vision 생략(텍스트 충실도 보존)`);
         return false;
@@ -252,10 +262,12 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
       });
       // kordoc 가 각 대상 페이지에서 본 '실제 표(2x2 이상)' 개수 — vision 이 표를 빠뜨리면
       // (개수 부족) 재시도하게 한다. 펼침면은 좌우로 나뉘므로 개수 비교가 부정확해 제외.
+      // 크램드 표(목차 등)는 올바른 출력이 리스트이므로 표 개수 기대에서 제외 — 안 그러면 vision 이
+      // 리스트로 잘 푼 것을 '표 누락'으로 오판해 표로 되돌리거나 kordoc 으로 폴백한다.
       const expectedTables = new Map();
       const targetSet = new Set(targets);
       for (const b of result.blocks || []) {
-        if (b.type !== "table" || !targetSet.has(b.pageNumber) || spreadForOcr.has(b.pageNumber)) continue;
+        if (b.type !== "table" || !targetSet.has(b.pageNumber) || spreadForOcr.has(b.pageNumber) || crammedPages.has(b.pageNumber)) continue;
         if ((b.table?.rows || 0) >= 2 && (b.table?.cols || 0) >= 2) {
           expectedTables.set(b.pageNumber, (expectedTables.get(b.pageNumber) || 0) + 1);
         }

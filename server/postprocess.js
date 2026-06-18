@@ -385,6 +385,18 @@ function htmlTableRows(tableMd) {
     )
   );
 }
+// kordoc 이 2D 레이아웃(목차 등)을 몇 개 셀에 <br> 로 욱여넣어 행 정렬을 잃은 '크램드 표'를 감지.
+// 이런 페이지는 결정론적 flatten 으론 평문 나열만 가능하고(정렬 복구 불가), vision 재추출이 2D
+// 구조(라벨↔제목↔페이지 정렬)를 복원하므로 reflow 대상으로 라우팅하는 데 쓴다. (export)
+export function hasCrammedTable(md) {
+  for (const t of String(md).match(/<table[\s\S]*?<\/table>/gi) || []) {
+    const cells = (t.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) || []).length;
+    const br = (t.match(/<br\s*\/?>/gi) || []).length;
+    if (cells > 0 && cells <= 6 && br >= 8) return true;
+  }
+  return false;
+}
+
 function flattenFakeTables(md) {
   if (!md || (md.indexOf("|") === -1 && !/<table/i.test(md))) return md;
   const lines = md.split("\n");
