@@ -123,6 +123,9 @@ export function postprocessMarkdown(md) {
   // '뒤'에 둔다 — 먼저 펴면 목차의 짧은 줄(항목·페이지번호)이 그 단계들에 삭제되어 내용이 누락된다.
   out = flattenFakeTables(out);
 
+  // 폰트 손상 PDF 에서 kordoc 이 줄바꿈마다 별도 문단으로 떠와 문장·단어가 끊긴 것을 합친다.
+  out = reflowSoftWrappedParagraphs(out);
+
   // 4) 과도한 빈 줄 축소 (3+ → 2) + 문서 앞뒤 공백 정리
   out = out.replace(/\n{3,}/g, "\n\n").replace(/^\s+/, "");
   out = out.replace(/\s+$/, "") + "\n";
@@ -310,6 +313,36 @@ function sectionHeadingFromBlock(block) {
   if (!/[가-힣A-Za-z]/.test(title) || SECTION_MARKER_RE.test(title)) return null; // 제목은 실제 텍스트
   const sep = ROMAN_OR_NUM_RE.test(marker) ? `${marker}.` : marker;
   return `## ${sep} ${title}`;
+}
+
+// kordoc 이 (폰트/레이아웃 손상 문서에서) PDF 줄바꿈마다 별도 문단으로 떠와 문장이 줄 단위로
+// 끊기고 단어가 음절 중간에서 갈라지는 경우(예: "퇴소"\n\n"를", "자립환"\n\n"경")를 한 문단으로
+// 합친다. 보수적: 앞 문단이 한글 음절로 끝나고(종결어미·구두점 아님) 본문 길이(>=15)이며 마커가
+// 아니고, 뒤 문단이 한글로 시작하며 마커(표·헤딩·목록·번호)가 아닐 때만 공백 없이 직결한다.
+// (이 문서 줄바꿈은 음절 중간 끊김이 다수라 공백 없이 잇는 편이 더 정확.) 종결문장·목록·표는 보존.
+const SENT_END = /[.!?。…:;」』”’)\]]\s*$|(?:다|요|죠|까|네|음|함|임|됨|니다|음\.|함\.)\s*$/;
+const CONT_MARKER = /^\s*(?:[#>|]|<|[-*∙·•]\s|[○◦●□■▪️※☞⚪◎]|[①-⑮㉠-㉭]|[0-9]+\s*[.)]\s|[가-하]\s*[.)]\s|\([0-9가-하]+\)|제\s*\d+\s*[장절조항관])/;
+function reflowSoftWrappedParagraphs(md) {
+  const paras = String(md).split(/\n{2,}/);
+  const out = [];
+  for (const p of paras) {
+    const t = p.replace(/[ \t]+$/, "");
+    const prev = out.length ? out[out.length - 1] : "";
+    // 마커로 시작한 줄도 '길면'(줄바꿈된 목록 항목) 자기 연속줄을 흡수하되, 짧은 마커(헤딩/라벨)는
+    // 보존한다. 연속줄은 한글뿐 아니라 숫자 시작도 허용("제"\n\n"32조의7" → "제32조의7").
+    const prevMergeable =
+      /[가-힣]$/.test(prev) && !SENT_END.test(prev) && prev.indexOf("\n") === -1 &&
+      (CONT_MARKER.test(prev) ? prev.length >= 30 : prev.length >= 15);
+    if (
+      t.trim() && prevMergeable &&
+      /^[0-9가-힣]/.test(t.trim()) && !CONT_MARKER.test(t) && t.indexOf("\n") === -1
+    ) {
+      out[out.length - 1] = prev + t.trim(); // 음절 중간 끊김 — 공백 없이 직결
+      continue;
+    }
+    out.push(t);
+  }
+  return out.join("\n\n");
 }
 
 // kordoc 이 목차·머리말·산문 등 비-표 내용을 '가짜 표'로 만든 경우를 감지해 평문으로 편다.
