@@ -11,7 +11,7 @@ import {
 } from "./vllm.js";
 import { resolveAiConfig, withAiConfig, aiEnabled, aiVisionEnabled } from "./ai.js";
 import { detectMangledPages } from "./detect.js";
-import { postprocessMarkdown, hasCrammedTable, looksLikeTocTable, hasSentenceStuffedTable } from "./postprocess.js";
+import { postprocessMarkdown, hasCrammedTable, looksLikeTocTable, hasSentenceStuffedTable, hasDuplicatedColumns } from "./postprocess.js";
 import { collectInvisibleText, stripInvisibleFromBlocks } from "./invisible.js";
 import { detectBoundaryIssues } from "../tests/quality.mjs";
 
@@ -249,7 +249,7 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
       // 잡았더라도 kordoc 텍스트를 유지(오탐 — vision 이 오히려 충실도를 낮춤).
       // 참고: 값 뭉침(crammed)처럼 '구조만' 나쁜 표는 여기서 스킵되어 vision 교정을 받지 못한다.
       // 내용 보존을 우선한 트레이드오프이며, 필요 시 이 게이트를 완화한다.
-      const deficient = broken || emptyCellRatio(pmd) >= 0.35 || NOSPACE_RUN.test(pmd) || crammedPages.has(pn) || hasSentenceStuffedTable(pmd);
+      const deficient = broken || emptyCellRatio(pmd) >= 0.35 || NOSPACE_RUN.test(pmd) || crammedPages.has(pn) || hasSentenceStuffedTable(pmd) || hasDuplicatedColumns(pmd);
       if (!deficient) {
         console.log(`[reflow] p${pn} kordoc 출력 양호 — vision 생략(텍스트 충실도 보존)`);
         return false;

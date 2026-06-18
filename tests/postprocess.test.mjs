@@ -1,6 +1,6 @@
 // postprocessMarkdown 회귀 테스트: 페이지번호/머리말·꼬리말 제거 + 페이지 경계 표 병합.
 // 실행: node tests/postprocess.test.mjs   → 통과 시 exit 0, 실패 시 exit 1
-import { postprocessMarkdown, hasSentenceStuffedTable } from "../server/postprocess.js";
+import { postprocessMarkdown, hasSentenceStuffedTable, hasDuplicatedColumns } from "../server/postprocess.js";
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✅ " + m); } else { fail++; console.log("  ❌ " + m); } };
@@ -174,6 +174,19 @@ console.log("\n[12] 문장 박힌 표 감지 — kordoc 레이아웃 실패(표+
   // 정상 데이터 표(숫자/짧은 라벨)는 false — 오탐 없음(보육료·통계표가 잘못 vision 라우팅되지 않게)
   ok(!hasSentenceStuffedTable('<table><tr><th>구분</th><th>3월</th></tr><tr><td>합계출산율</td><td>0.93</td></tr></table>'), "정상 데이터 표 → false");
   ok(!hasSentenceStuffedTable("| 구분 | 3월 | 1~3월 |\n| --- | --- | --- |\n| 출생아 수 | 25,200 | 75,013 |"), "정상 pipe 표 → false");
+}
+
+console.log("\n[13] 열 복제 감지 — kordoc 비교표(현행/개정)를 한 열만 읽어 양쪽에 복제한 실패 패턴");
+{
+  const long = "입양동의서(입양특례법 시행규칙 별지 제8호 서식)는 가정법원에 입양허가 신청 시 제출해야함";
+  // 긴 동일 내용이 인접 열에 든 행 2개+ → true (vision 라우팅 대상)
+  ok(hasDuplicatedColumns(`| 25 | ${long} | ${long} |\n| --- | --- | --- |\n| 26 | ${long} 다른시작 | ${long} 다른시작 |`), "긴 동일 인접열 2행+ → true");
+  // 1행만 동일 → false (우연 1건은 제외)
+  ok(!hasDuplicatedColumns(`| 25 | ${long} | ${long} |\n| 26 | 가 | 나 |`), "동일 1행뿐 → false");
+  // 정상 비교표(좌우 다름) → false
+  ok(!hasDuplicatedColumns(`| 쪽 | 현행 내용이 길게 들어있는 셀 | 개정 내용이 길게 들어있는 셀 |\n| 26 | 또 다른 긴 현행 내용 셀 | 또 다른 긴 개정 내용 셀 |`), "좌우 다른 정상 비교표 → false");
+  // 짧은 동일 셀(숫자 등) → false (>=20자 가드)
+  ok(!hasDuplicatedColumns("| 0.93 | 0.93 |\n| 0.80 | 0.80 |\n| 100 | 100 |"), "짧은 동일 셀(숫자) → false");
 }
 
 console.log(`\n결과: ${pass} 통과 / ${fail} 실패`);

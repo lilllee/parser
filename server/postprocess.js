@@ -454,6 +454,30 @@ export function hasSentenceStuffedTable(md) {
   return false;
 }
 
+// kordoc 이 좌우 비교표(현행/개정·변경전후 등)에서 한 열만 읽어 양쪽 열에 같은 내용을 복제하는
+// 실패 패턴 감지. 긴(>=20자) 동일 내용이 인접 두 열에 든 행이 2개 이상이면 '열 복제'로 본다 —
+// 정상 비교표도 '안 바뀐 행'은 좌우가 같을 수 있으나, 긴 셀이 여러 행에서 통째로 복제되는 건
+// 추출 실패 신호다. 이런 페이지는 vision 이 좌우를 제대로 분리하므로 reflow 라우팅 대상. (export)
+const dupRow = (cells) => {
+  for (let i = 0; i < cells.length - 1; i++) {
+    const a = cells[i];
+    if (a && a.length >= 20 && a === cells[i + 1]) return true;
+  }
+  return false;
+};
+export function hasDuplicatedColumns(md) {
+  let n = 0;
+  for (const line of String(md).split("\n")) {
+    if (!/^\s*\|.*\|/.test(line) || isSeparatorRow(line)) continue;
+    if (dupRow(line.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map((c) => c.trim())) && ++n >= 2) return true;
+  }
+  for (const row of String(md).match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || []) {
+    const cells = (row.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) || []).map((c) => c.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+    if (dupRow(cells) && ++n >= 2) return true;
+  }
+  return false;
+}
+
 // 목차가 표(파이프/HTML)로 잘못 떠진 경우 감지: 데이터 행의 절반 이상이 'N-N(또는 제N장) … 페이지번호'
 // 패턴이면 TOC 표로 본다. 제목이 컬럼에 쪼개진 파이프 목차(크램드 HTML 이 아닌)도 잡아 vision 라우팅.
 // 진짜 데이터 표는 '섹션라벨 … 단독 페이지번호' 행이 드물어 안 걸린다. (export)
