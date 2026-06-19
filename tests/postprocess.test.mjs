@@ -1,6 +1,6 @@
 // postprocessMarkdown 회귀 테스트: 페이지번호/머리말·꼬리말 제거 + 페이지 경계 표 병합.
 // 실행: node tests/postprocess.test.mjs   → 통과 시 exit 0, 실패 시 exit 1
-import { postprocessMarkdown, hasSentenceStuffedTable, hasDuplicatedColumns } from "../server/postprocess.js";
+import { postprocessMarkdown, hasSentenceStuffedTable, hasDuplicatedColumns, comparePageNumbers } from "../server/postprocess.js";
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✅ " + m); } else { fail++; console.log("  ❌ " + m); } };
@@ -187,6 +187,31 @@ console.log("\n[13] 열 복제 감지 — kordoc 비교표(현행/개정)를 한
   ok(!hasDuplicatedColumns(`| 쪽 | 현행 내용이 길게 들어있는 셀 | 개정 내용이 길게 들어있는 셀 |\n| 26 | 또 다른 긴 현행 내용 셀 | 또 다른 긴 개정 내용 셀 |`), "좌우 다른 정상 비교표 → false");
   // 짧은 동일 셀(숫자 등) → false (>=20자 가드)
   ok(!hasDuplicatedColumns("| 0.93 | 0.93 |\n| 0.80 | 0.80 |\n| 100 | 100 |"), "짧은 동일 셀(숫자) → false");
+}
+
+console.log("\n[14] comparePageNumbers — force_ocr 페이지별 kordoc↔vision 숫자 대조 검증");
+{
+  // kordoc 산산조각 텍스트라도 '숫자'는 다 들어있다 → vision 이 같은 숫자면 ok
+  const kordoc = "지원인원 2,306 명 소요예산 1,383,720 천원 도 30% 시군 70% 합계출산율 0.93";
+  const visionGood = "- 지원인원: 2,306명\n- 소요예산: 1,383,720천원(도 30%, 시군 70%)\n- 합계출산율 0.93";
+  const g = comparePageNumbers(kordoc, visionGood);
+  ok(g.ok && !g.unverified && g.missing.length === 0 && g.extra.length === 0, "숫자 일치 → ok(검증됨)");
+
+  // vision 이 2,306 → 2,308 로 오독 → missing[2306] + extra[2308] 로 잡힘
+  const visionBad = "- 지원인원: 2,308명\n- 소요예산: 1,383,720천원(도 30%, 시군 70%)\n- 합계출산율 0.93";
+  const b = comparePageNumbers(kordoc, visionBad);
+  ok(!b.ok && b.missing.includes("2306") && b.extra.includes("2308"), "숫자 오독 → 불일치(누락 2306 / 추가 2308)");
+
+  // 1~2자리 노이즈(페이지번호/리스트마커)는 무시 — 의미있는 숫자만 비교
+  ok(comparePageNumbers("19 5 2", "- 19 -\n5회\n2개").ok, "1~2자리 노이즈는 검증서 제외 → ok");
+
+  // extra 만(vision 이 kordoc 보다 숫자 많음 — 연도/미추출영역) → ok=true (정보일 뿐, 오류 아님)
+  const e = comparePageNumbers("합계 100", "합계 100\n2024년 기준\n추가수치 12,345");
+  ok(e.ok && e.missing.length === 0 && e.extra.length > 0, "extra만(vision 더 완전) → ok=true, extra는 정보");
+
+  // kordoc 텍스트 없음(스캔 페이지) → unverified(=ok, 무근거)
+  const u = comparePageNumbers("", "출생아 25,200명");
+  ok(u.unverified && u.ok && u.kordocNumbers === 0, "kordoc 비면 unverified(무근거)");
 }
 
 console.log(`\n결과: ${pass} 통과 / ${fail} 실패`);

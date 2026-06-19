@@ -755,7 +755,8 @@ export async function ocrPdfBuffer(arrayBuffer, { onProgress, onPage, collectVis
     .filter(Boolean);
 
   visualPages.sort((a, b) => a.page - b.page);
-  return { markdown: sections.join("\n\n---\n\n"), pageCount, ocrPages: okCount, visualPages };
+  // pageTexts: 페이지별 vision 전사(인덱스 = page-1). kordoc 숫자 대조 검증 등에 쓴다.
+  return { markdown: sections.join("\n\n---\n\n"), pageCount, ocrPages: okCount, visualPages, pageTexts: texts };
 }
 
 // 2-page spread(펼침면): landscape 페이지 폭이 세로 페이지 폭의 ~2배면 펼침면으로 판정한다.

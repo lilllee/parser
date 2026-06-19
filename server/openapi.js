@@ -192,6 +192,11 @@ export const openapiSpec = {
             default: "md",
             description: "출력 표 포맷. md(기본): 사람/RAG 가독용 markdown 파이프 표. html: <table> 구조 보존(병합셀·ParseBench GRITS 등 HTML 표만 인식하는 소비처용).",
           },
+          force_ocr: {
+            type: "boolean",
+            default: false,
+            description: "true 면 kordoc 을 건너뛰고 PDF 모든 페이지를 vision OCR 로 직접 전사(+postprocess·enrich). kordoc 이 dense 한 한국어 표를 열 뜯김/표→산문/공백오염으로 망치는 정부문서 등에 권장. 추가로 페이지별 숫자 검증을 수행 — kordoc 텍스트레이어 숫자와 대조해 vision 오독 의심 페이지를 metadata.verification 과 NUMERIC_MISMATCH 경고로 표면화한다(출력은 vision 유지). vision provider(vllm/bedrock/anthropic) 필요. mineru provider 에는 무효. (mode=vision 으로도 켜짐)",
+          },
           api_key: {
             type: "string",
             description: "[openai / anthropic / gemini] API 키.",
@@ -240,6 +245,12 @@ export const openapiSpec = {
             type: "integer",
             nullable: true,
             description: "PDF 페이지 수 / HWP·HWPX 섹션 수 / XLSX 시트 수",
+          },
+          verification: {
+            type: "array",
+            nullable: true,
+            description: "force_ocr 시에만. 페이지별 숫자 대조 결과 — { page, kordocNumbers, missing[], extra[], ok, unverified }. ok=false 면 vision 숫자가 kordoc 과 어긋남(육안 확인), unverified=true 면 kordoc 텍스트 없음(스캔, 무근거).",
+            items: { type: "object", additionalProperties: true },
           },
           elapsedMs: {
             type: "integer",

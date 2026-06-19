@@ -54,8 +54,13 @@ app.post("/api/convert", async (c) => {
   // 출력 표 포맷: md(기본, 사람/RAG 가독) | html(<table>, 구조보존·ParseBench GRITS 등).
   const format = String(body.format || body.output_format || "md").toLowerCase() === "html" ? "html" : "md";
 
+  // 강제 전체페이지 vision OCR (kordoc 우회). dense 표를 kordoc 이 산산조각 내는 PDF용. vision provider 필요.
+  const forceOcr =
+    /^(1|true|on|yes)$/i.test(String(body.force_ocr ?? body.ocr ?? "")) ||
+    String(body.mode || "").toLowerCase() === "vision";
+
   try {
-    const result = await runConvert(arrayBuffer, filename, {}, aiConfig);
+    const result = await runConvert(arrayBuffer, filename, { forceOcr }, aiConfig);
     const markdown = format === "html" ? markdownTablesToHtml(result.markdown || "") : result.markdown;
     return c.json({ ok: true, ...result, markdown, format, elapsedMs: elapsedMs() });
   } catch (e) {
