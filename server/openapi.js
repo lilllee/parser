@@ -2,6 +2,7 @@
 
 const VLLM_URL_DEFAULT = process.env.VLLM_URL || "http://localhost:8000/v1/chat/completions";
 const VLLM_MODEL_DEFAULT = process.env.VLLM_MODEL || "qwen/qwen3.6-27b";
+const MINERU_URL_DEFAULT = process.env.MINERU_URL || "http://localhost:8000";
 const VLLM_THINKING_DEFAULT = process.env.VLLM_THINKING === "1";
 const BEDROCK_REGION_DEFAULT = process.env.BEDROCK_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
 const BEDROCK_MODEL_DEFAULT = process.env.BEDROCK_MODEL || "anthropic.claude-3-5-sonnet-20241022-v2:0";
@@ -109,7 +110,7 @@ export const openapiSpec = {
         type: "object",
         required: ["file"],
         description:
-          "provider 에 따라 쓰이는 설정 필드가 다르다 — vllm: url/model/thinking · openai·anthropic: api_key/model/base_url · gemini: api_key/model/base_url(generateContent) · bedrock: region/model/profile/access_key_id/secret_access_key/session_token · claude_cli·codex_cli: model. 생략한 값은 서버 .env 기본값을 쓴다.",
+          "provider 에 따라 쓰이는 설정 필드가 다르다 — vllm: url/model/thinking · openai·anthropic: api_key/model/base_url · gemini: api_key/model/base_url(generateContent) · bedrock: region/model/profile/access_key_id/secret_access_key/session_token · claude_cli·codex_cli: model · mineru: url(hybrid:8000)/pipeline_url(:8002)/backend(auto)/lang/parse_method/effort/table/formula/image_analysis/postprocess. 생략한 값은 서버 .env 기본값을 쓴다. ⚠ mineru 는 페이지별 vision 이 아니라 파일을 통째 업로드해 MinerU 서버가 직접 md 로 변환하는 '문서 파서' 엔진 — kordoc/reflow/enrich 파이프라인을 우회한다(원본 md 그대로, postprocess=true 면 우리 후처리 적용). backend=auto 면 이미지는 pipeline(한글 정확)·그 외는 hybrid-engine(복잡 표)로 자동 라우팅.",
         properties: {
           file: {
             type: "string",
@@ -118,14 +119,62 @@ export const openapiSpec = {
           },
           provider: {
             type: "string",
-            enum: ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli"],
+            enum: ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli", "mineru"],
             default: "vllm",
-            description: "AI 백엔드 (OCR·시각자료 분석). 미지정 시 vllm.",
+            description: "AI 백엔드 (OCR·시각자료 분석). 미지정 시 vllm. mineru = 파일 통째 업로드형 문서 파서(MinerU).",
           },
           url: {
             type: "string",
             default: VLLM_URL_DEFAULT,
-            description: "[vllm] OpenAI 호환 chat completions 엔드포인트.",
+            description: `[vllm] OpenAI 호환 chat completions 엔드포인트. [mineru] 는 hybrid-engine base URL(예: ${MINERU_URL_DEFAULT}) — /file_parse·/health 는 자동으로 붙인다. pipeline 백엔드 URL 은 pipeline_url 로 따로 준다.`,
+          },
+          pipeline_url: {
+            type: "string",
+            default: process.env.MINERU_PIPELINE_URL || "http://localhost:8002",
+            description: "[mineru] pipeline 백엔드(PaddleOCR) base URL. 이미지/포스터/장식 폰트의 정확한 한글 전사용 — hybrid-engine 의 글자깨짐·한→일 드리프트·환각·`#` 삽입을 피한다.",
+          },
+          backend: {
+            type: "string",
+            enum: ["auto", "hybrid-engine", "pipeline"],
+            default: process.env.MINERU_BACKEND || "auto",
+            description: "[mineru] 백엔드 라우팅. auto(기본)=이미지는 pipeline(:8002, 한글 정확)·그 외는 hybrid-engine(:8000, 복잡 표/다단). hybrid-engine/pipeline 으로 강제 지정 가능.",
+          },
+          effort: {
+            type: "string",
+            enum: ["", "low", "medium", "high"],
+            default: process.env.MINERU_EFFORT || "",
+            description: "[mineru] 품질 vs 속도. 비우면 서버 기본(medium). 값이 있을 때만 전송.",
+          },
+          lang: {
+            type: "string",
+            default: process.env.MINERU_LANG || "korean",
+            description: "[mineru] OCR 언어 (lang_list). 한국어 = korean. pipeline 백엔드에서 실제 적용됨(hybrid 는 거의 무시).",
+          },
+          parse_method: {
+            type: "string",
+            enum: ["auto", "txt", "ocr"],
+            default: process.env.MINERU_PARSE_METHOD || "auto",
+            description: "[mineru] auto(텍스트레이어 자동 판별) / txt(텍스트레이어) / ocr(강제 OCR).",
+          },
+          table: {
+            type: "boolean",
+            default: process.env.MINERU_TABLE !== "0",
+            description: "[mineru] 표 인식(table_enable).",
+          },
+          formula: {
+            type: "boolean",
+            default: process.env.MINERU_FORMULA !== "0",
+            description: "[mineru] 수식 인식(formula_enable). 끄면 계¹⁾ 등이 $..$ 로 안 싸여 더 깔끔할 수 있음.",
+          },
+          image_analysis: {
+            type: "boolean",
+            default: process.env.MINERU_IMAGE_ANALYSIS === "1",
+            description: "[mineru] 이미지/차트 분석. 켜면 그림 설명이 붙는지 확인용(기본 off — 원본 점검).",
+          },
+          postprocess: {
+            type: "boolean",
+            default: process.env.MINERU_POSTPROCESS === "1",
+            description: "[mineru] 우리 postprocess(공백/reflow/글리프 정리) 적용 여부. 기본 false = MinerU 원본 md 그대로(육안 점검·비교용).",
           },
           model: {
             type: "string",

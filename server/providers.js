@@ -480,6 +480,139 @@ const codexCliProvider = {
   pingPrompt: "Reply with the single word: ping",
 };
 
+// MinerU 문서 파싱 REST API. OpenAI 호환 chat 이 아니라 — 파일을 multipart 로 통째 업로드하면
+// 서버 파이프라인(레이아웃+OCR+표+읽기순서)이 한 번에 markdown 으로 변환한다. 그래서 페이지 단위
+// build/parse/complete 대신 '파일 단위' parseDocument 를 쓰고(kind:"document-parser"), convert.js 가
+// 이 엔진을 만나면 kordoc/reflow/enrich 파이프라인을 통째 우회한다. (HWP/HWPX 는 MinerU 가 못 먹으니
+// PDF·이미지·DOCX 위주 — 그 외 포맷은 기존 vllm 파이프라인을 쓸 것.)
+function mineruEndpoint(url, path) {
+  // 사용자가 base(http://host:8000) 또는 풀 경로(.../file_parse)를 넣을 수 있으니 정규화.
+  const root = String(url || "").replace(/\/+$/, "").replace(/\/file_parse$/, "");
+  return `${root}${path}`;
+}
+
+const MINERU_FILE_MIME = {
+  pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  webp: "image/webp", gif: "image/gif", bmp: "image/bmp", tif: "image/tiff", tiff: "image/tiff",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+};
+function mineruMime(filename) {
+  const ext = String(filename || "").split(".").pop().toLowerCase();
+  return MINERU_FILE_MIME[ext] || "application/octet-stream";
+}
+
+const MINERU_IMAGE_EXT = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"]);
+function isMineruImage(filename) {
+  return MINERU_IMAGE_EXT.has(String(filename || "").split(".").pop().toLowerCase());
+}
+
+// MinerU 는 백엔드가 둘이고 OCR 특성이 정반대다(서버 가이드 MINERU_API.md):
+//  · hybrid-engine(VLM, :8000) — 복잡한 표/다단/수식엔 강하나 '스타일·장식 폰트' 이미지에서
+//    글자 깨짐·한→일 언어 드리프트·환각·`#/##` 오삽입(고질병). lang_list 거의 무시.
+//  · pipeline(PaddleOCR 계열, :8002) — lang_list=korean 이 실제 적용돼 한글 전사가 정확. 포스터/
+//    배너/장식 폰트에 강함. 복잡한 표/레이아웃은 약함.
+// 그래서 파일·설정으로 (backend, baseUrl)을 라우팅한다. auto: 이미지=pipeline, 그 외(PDF/DOCX)=hybrid.
+// (export 는 단위 테스트용 — 네트워크 없이 라우팅만 검증.)
+export function mineruRoute(filename, cfg) {
+  let backend = cfg.backend || "auto";
+  if (backend === "auto") backend = isMineruImage(filename) ? "pipeline" : "hybrid-engine";
+  let base = backend === "pipeline" ? cfg.pipeline_url : cfg.url;
+  // 원하는 백엔드의 서버 URL 이 비어 있으면, 설정된 다른 서버로 폴백하고 backend 도 그에 맞춘다
+  // (pipeline 백엔드를 hybrid 서버로 보내면 CUDA error 로 죽으므로 backend 값을 서버와 일치시킨다).
+  if (!base) {
+    base = cfg.url || cfg.pipeline_url;
+    backend = base && base === cfg.pipeline_url ? "pipeline" : "hybrid-engine";
+  }
+  return { backend, base };
+}
+
+const mineruProvider = {
+  id: "mineru",
+  kind: "document-parser", // 페이지 단위 completer 가 아니라 파일 단위 파서 — convert 가 파이프라인 우회.
+  fields: ["url", "pipeline_url", "backend", "lang", "parse_method", "effort", "table", "formula", "image_analysis", "postprocess", "timeout_ms"],
+  defaults: () => ({
+    url: process.env.MINERU_URL || "",                     // hybrid-engine(VLM, :8000) — 복잡 표/다단/PDF
+    pipeline_url: process.env.MINERU_PIPELINE_URL || "",   // pipeline(PaddleOCR, :8002) — 이미지/포스터/한글 정확
+    backend: process.env.MINERU_BACKEND || "auto",         // auto | hybrid-engine | pipeline
+    lang: process.env.MINERU_LANG || "korean",
+    parse_method: process.env.MINERU_PARSE_METHOD || "auto",
+    effort: process.env.MINERU_EFFORT || "",               // ""(미전송) | low | medium | high
+    table: process.env.MINERU_TABLE !== "0",
+    formula: process.env.MINERU_FORMULA !== "0",
+    image_analysis: process.env.MINERU_IMAGE_ANALYSIS === "1",
+    // 육안 점검 기본은 MinerU '원본' md 그대로 — 우리 postprocess 를 끼우면 비교가 흐려진다. 1 로 켜면 적용.
+    postprocess: process.env.MINERU_POSTPROCESS === "1",
+    timeout_ms: Number(process.env.MINERU_TIMEOUT_MS || 600_000),
+  }),
+  enabled: (cfg) => !!(cfg.url || cfg.pipeline_url) && process.env.MINERU_DISABLED !== "1",
+  info: (cfg) => ({
+    hybrid: cfg.url ? mineruEndpoint(cfg.url, "/file_parse") : null,
+    pipeline: cfg.pipeline_url ? mineruEndpoint(cfg.pipeline_url, "/file_parse") : null,
+    backend: cfg.backend,
+    lang: cfg.lang,
+  }),
+  // chat completer 가 아니므로 aiPing 은 /health 로 점검한다(아래 ai.js 가 provider.ping 우선 사용).
+  async ping(cfg) {
+    const url = mineruEndpoint(cfg.url || cfg.pipeline_url, "/health");
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 10_000);
+    try {
+      const resp = await fetch(url, { signal: ac.signal });
+      if (!resp.ok) throw new Error(`MinerU /health HTTP ${resp.status}`);
+      return { text: "healthy", url };
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+  // 파일 통째 업로드 → { markdown, pageCount, metadata }. convert.js 의 documentParserConvert 가 호출.
+  async parseDocument(cfg, { buffer, filename, onPhase = () => {} }) {
+    // 이미지=pipeline(:8002, 한글 정확) / PDF·DOCX=hybrid-engine(:8000, 복잡 표) 로 라우팅.
+    const { backend, base } = mineruRoute(filename, cfg);
+    if (!base) throw new Error("MinerU URL 미설정 (MINERU_URL / MINERU_PIPELINE_URL)");
+    const url = mineruEndpoint(base, "/file_parse");
+    const form = new FormData();
+    form.append("files", new Blob([buffer], { type: mineruMime(filename) }), filename || "document.pdf");
+    form.append("backend", backend);
+    form.append("lang_list", cfg.lang);
+    form.append("parse_method", cfg.parse_method);
+    if (cfg.effort) form.append("effort", cfg.effort);
+    form.append("table_enable", String(!!cfg.table));
+    form.append("formula_enable", String(!!cfg.formula));
+    form.append("image_analysis", String(!!cfg.image_analysis));
+    form.append("return_md", "true");
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), cfg.timeout_ms);
+    let resp;
+    try {
+      onPhase({ phase: "parse", message: `MinerU(${backend}) 업로드 → ${url}` });
+      resp = await fetch(url, { method: "POST", body: form, signal: ac.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => "");
+      const err = new Error(`MinerU HTTP ${resp.status} ${detail.slice(0, 300)}`);
+      err.status = resp.status;
+      throw err;
+    }
+    const data = await resp.json();
+    if (data.status && data.status !== "completed") {
+      throw new Error(`MinerU 파싱 실패: status=${data.status} error=${data.error || ""}`);
+    }
+    const fname = data.file_names?.[0];
+    const md = (fname && data.results?.[fname]?.md_content) || data.md_content || "";
+    if (!md) throw new Error("MinerU 응답에 md_content 가 없음");
+    return {
+      markdown: md,
+      pageCount: null,
+      metadata: { source: "mineru", backend: data.backend || backend, version: data.version, file: fname },
+    };
+  },
+  pingPrompt: "health",
+};
+
 export const PROVIDERS = {
   vllm: vllmProvider,
   openai: openaiProvider,
@@ -489,8 +622,9 @@ export const PROVIDERS = {
   codex: codexProvider,
   "claude-cli": claudeCliProvider,
   "codex-cli": codexCliProvider,
+  mineru: mineruProvider,
 };
 
 export const PROVIDER_ALIASES = { claude_cli: "claude-cli", codex_cli: "codex-cli" };
 
-export const PROVIDER_CHOICES = ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli"];
+export const PROVIDER_CHOICES = ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli", "mineru"];

@@ -160,6 +160,8 @@ export async function aiPing(ai) {
   const { id, provider: p, cfg } = ai;
   if (!p.enabled(cfg)) return { ok: false, enabled: false, provider: id, error: `${id} provider 미설정` };
   try {
+    // 문서 파서 엔진(MinerU 등)은 chat completer 가 아니라 자체 ping(/health)으로 점검한다.
+    if (p.ping) return { ok: true, enabled: true, provider: id, ...(await p.ping(cfg)) };
     const text = await withAiConfig(ai, () =>
       aiComplete({ prompt: p.pingPrompt || "ping", maxTokens: 8, temperature: 0 })
     );

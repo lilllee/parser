@@ -1,6 +1,7 @@
 // AI 프로바이더 추상화 회귀 테스트 (외부 API 호출 없음 — 요청 포맷만 검증)
 // 확장성 보장: vllm/openai/anthropic 로 전환 시 각 API 포맷이 올바른지 단언.
 import { buildRequest, PROVIDER_IDS, resolveAiConfig } from "../server/ai.js";
+import { mineruRoute } from "../server/providers.js";
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  ✅ " + m); } else { fail++; console.log("  ❌ " + m); } };
@@ -74,6 +75,40 @@ console.log("\n[bedrock] Converse SDK provider 설정 병합");
   ok(ai.cfg.region === "ap-northeast-2", "region override");
   ok(ai.cfg.model.includes("claude-3-5-sonnet"), "model override");
   ok(ai.cfg.profile === "dev-profile", "profile override");
+}
+
+console.log("\n[mineru] 문서 파서 엔진 — 파일 단위 parseDocument(페이지 단위 build/complete 아님)");
+{
+  const ai = resolveAiConfig({ provider: "mineru", url: "http://10.0.0.9:8000/" });
+  ok(ai.id === "mineru", "provider=mineru 해석");
+  ok(typeof ai.provider.parseDocument === "function", "parseDocument(파일 단위) 보유");
+  ok(!ai.provider.build && !ai.provider.complete, "페이지 단위 build/complete 는 없음(파이프라인 우회 신호)");
+  ok(ai.provider.kind === "document-parser", "kind=document-parser");
+  ok(typeof ai.provider.ping === "function", "ping(/health) 보유 — aiPing 이 chat 대신 사용");
+  ok(ai.cfg.url === "http://10.0.0.9:8000/" && ai.cfg.lang === "korean" && ai.cfg.postprocess === false,
+    "url override + 기본 lang=korean + postprocess 기본 off(원본 점검)");
+  ok(ai.provider.enabled(ai.cfg) === true, "url 있으면 enabled");
+  ok(ai.provider.enabled({ ...ai.cfg, url: "", pipeline_url: "" }) === false, "url/pipeline_url 모두 비면 disabled");
+  ok(ai.provider.enabled({ url: "", pipeline_url: "http://h:8002" }) === true, "pipeline_url 만 있어도 enabled");
+}
+
+console.log("\n[mineru] 백엔드 라우팅 — 이미지→pipeline(:8002, 한글정확) / PDF·DOCX→hybrid(:8000)");
+{
+  const cfg = { url: "http://h:8000", pipeline_url: "http://h:8002", backend: "auto" };
+  ok(JSON.stringify(mineruRoute("poster.jpg", cfg)) === JSON.stringify({ backend: "pipeline", base: "http://h:8002" }),
+    "auto + 이미지(.jpg) → pipeline:8002");
+  ok(mineruRoute("notice.png", cfg).backend === "pipeline", "auto + .png → pipeline");
+  ok(JSON.stringify(mineruRoute("report.pdf", cfg)) === JSON.stringify({ backend: "hybrid-engine", base: "http://h:8000" }),
+    "auto + PDF → hybrid-engine:8000");
+  ok(mineruRoute("doc.docx", cfg).backend === "hybrid-engine", "auto + DOCX → hybrid-engine");
+  ok(mineruRoute("poster.jpg", { ...cfg, backend: "hybrid-engine" }).backend === "hybrid-engine",
+    "backend 강제 지정이 auto 라우팅보다 우선(이미지도 hybrid 로)");
+  ok(mineruRoute("report.pdf", { ...cfg, backend: "pipeline" }).base === "http://h:8002",
+    "backend=pipeline 강제 → pipeline URL");
+  // 폴백: 원하는 백엔드 서버 URL 이 비면 있는 서버로 보내고 backend 도 일치시킨다(엉뚱한 서버에 pipeline 전송 방지).
+  const r = mineruRoute("poster.jpg", { url: "http://h:8000", pipeline_url: "", backend: "auto" });
+  ok(r.base === "http://h:8000" && r.backend === "hybrid-engine",
+    "pipeline_url 없음 → hybrid 로 폴백 + backend=hybrid-engine(서버와 일치)");
 }
 
 console.log(`\n결과: ${pass} 통과 / ${fail} 실패`);

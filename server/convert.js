@@ -16,10 +16,42 @@ import { collectInvisibleText, stripInvisibleFromBlocks } from "./invisible.js";
 import { detectBoundaryIssues } from "../tests/quality.mjs";
 
 export async function runConvert(arrayBuffer, filename, sink = {}, aiConfig = resolveAiConfig()) {
+  // MinerU 등 '문서 파서' 엔진은 파일을 통째 올려 한 번에 md 를 받는다 — kordoc/reflow/enrich 우회.
+  if (aiConfig.provider?.parseDocument) {
+    return documentParserConvert(arrayBuffer, filename, sink, aiConfig);
+  }
   // 요청별 AI 설정을 컨텍스트에 깔아 내부 aiComplete 들이 같은 provider 를 쓰게 한다(ALS).
   return withAiConfig(aiConfig, () =>
     _runConvert(arrayBuffer, filename, sink, aiEnabled(aiConfig), aiVisionEnabled(aiConfig))
   );
+}
+
+// 문서 파서 엔진(MinerU 등): 파일 통째 업로드 → 전체 markdown. kordoc 파이프라인을 타지 않는다.
+// 기본은 엔진 '원본' md 그대로 반환(육안 점검·비교용). cfg.postprocess=true 면 우리 후처리를 끼운다.
+async function documentParserConvert(arrayBuffer, filename, sink, aiConfig) {
+  const onPhase = sink.onPhase || (() => {});
+  const onProgress = sink.onProgress || (() => {});
+  const onWarning = sink.onWarning || (() => {});
+  const { id, provider: p, cfg } = aiConfig;
+  if (!p.enabled(cfg)) {
+    const err = new Error(`${id} 엔진 미설정 — URL 을 확인하세요 (MINERU_URL 또는 요청 url).`);
+    err.code = "ENGINE_DISABLED";
+    throw err;
+  }
+  onPhase({ phase: "parse", message: `${id} 문서 파싱` });
+  const r = await p.parseDocument(cfg, { buffer: arrayBuffer, filename, onPhase });
+  const raw = r.markdown || "";
+  const cleaned = cfg.postprocess ? postprocessMarkdown(raw) : raw;
+  for (const w of detectBoundaryIssues(cleaned, filename).warnings) onWarning(w);
+  onProgress({ progress: 1 });
+  console.log(
+    `[convert] ${filename} 완료 · ${id} · md ${cleaned.length}자${cfg.postprocess ? " (postprocess)" : " (raw)"}`
+  );
+  return {
+    markdown: cleaned,
+    metadata: r.metadata || { source: id },
+    pageCount: r.pageCount ?? null,
+  };
 }
 
 // enabled: 이 변환에서 AI(OCR/enrich)를 쓸 수 있는지 — 요청 provider 기준.
