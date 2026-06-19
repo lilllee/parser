@@ -69,13 +69,15 @@ export async function aiComplete({
   topP,
   presencePenalty,
   repetitionPenalty,
+  frequencyPenalty,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 }) {
   const ai = currentAiConfig();
   const { provider: p, cfg } = ai;
   if (!p.enabled(cfg)) return "";
-  // system 메시지는 vllm/openai(supportsSystem)만 별도 메시지로 보낸다 — 모든 요청에서
-  // byte 동일한 공통 지시문이 맨 앞에 오게 해 vLLM prefix cache 를 살린다.
+  // system 메시지는 vllm/openai(supportsSystem)만 별도 메시지로 보낸다 — 공통 지시문을 맨 앞에 둔다.
+  // (qwen3.6-27b 하이브리드 Mamba/GDN 은 prefix-cache 적중 ~0% 라 '캐시 이득'은 없다; 그래도 표준
+  //  형식이라 system 분리는 유지하되, 지시문 자체는 간결히 — 매 호출 재-prefill 되므로.)
   // 미지원 provider 는 기존 동작 보존을 위해 prompt 앞에 병합.
   let sys = system;
   let userPrompt = prompt;
@@ -102,6 +104,7 @@ export async function aiComplete({
         topP,
         presencePenalty,
         repetitionPenalty,
+        frequencyPenalty,
       });
       const json = await fetchJson(req, timeoutMs);
       if (isTruncated(json)) {
@@ -126,6 +129,17 @@ export function aiEnabled(aiConfig) {
   return p.enabled(cfg);
 }
 
+// CLI 에이전트 provider(claude -p)의 이미지(vision) 호출은 매번 풀 에이전트를 cold-boot 하고
+// 간헐적으로 타임아웃까지 행이 걸린다. 그래서 claude-cli 는 기본 '텍스트 전용'으로 동작한다 —
+// kordoc 추출 + 표 텍스트 분석만 하고 OCR/reflow/이미지·차트 같은 vision 단계는 건너뛴다.
+// 행을 감수하고 vision 을 켜려면 CLAUDE_CLI_VISION=1. (codex-cli 는 vision 이 느려도 동작하므로 on.)
+// env 는 호출 시점에 읽는다(.env 가 import 이후 로드되므로 모듈 평가 시점에 읽으면 놓친다).
+export function aiVisionEnabled(aiConfig) {
+  const { id } = aiConfig || currentAiConfig();
+  if (id === "claude-cli") return process.env.CLAUDE_CLI_VISION === "1";
+  return true;
+}
+
 // 실제 전송 없이 provider 의 HTTP 요청 객체만 생성(테스트용).
 export function buildRequest({ providerId, prompt, text, image, maxTokens = 512, temperature = 0.2 }) {
   const id = PROVIDER_ALIASES[providerId] || providerId || process.env.AI_PROVIDER || "vllm";
@@ -146,6 +160,8 @@ export async function aiPing(ai) {
   const { id, provider: p, cfg } = ai;
   if (!p.enabled(cfg)) return { ok: false, enabled: false, provider: id, error: `${id} provider 미설정` };
   try {
+    // 문서 파서 엔진(MinerU 등)은 chat completer 가 아니라 자체 ping(/health)으로 점검한다.
+    if (p.ping) return { ok: true, enabled: true, provider: id, ...(await p.ping(cfg)) };
     const text = await withAiConfig(ai, () =>
       aiComplete({ prompt: p.pingPrompt || "ping", maxTokens: 8, temperature: 0 })
     );

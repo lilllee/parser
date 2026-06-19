@@ -19,11 +19,33 @@ export function scoreMarkdown(md) {
     return l.split("|").some((cell) => (cell.match(/\d{1,3}(?:,\d{3})+/g) || []).length >= 6);
   }).length;
 
-  // 3) 코드펜스 잔재 (모델이 ```markdown 으로 감쌈)
-  issues.codeFences = (md.match(/^[ \t]*```/gm) || []).length;
+  // 3) 코드펜스 잔재 (모델이 ```markdown 으로 감쌈) — 단, ```mermaid/graph 등 다이어그램 블록은
+  //    의도된 산출물(흐름도)이라 결함이 아니다. 다이어그램 블록의 여는/닫는 펜스 2개씩을 제외한다.
+  const allFences = (md.match(/^[ \t]*```/gm) || []).length;
+  const diagramBlocks = (md.match(/^[ \t]*```(?:mermaid|graph|flowchart|sequenceDiagram|gantt|classDiagram|stateDiagram|erDiagram|dot)\b/gim) || []).length;
+  issues.codeFences = Math.max(0, allFences - 2 * diagramBlocks);
 
-  // 4) 단독 페이지번호/푸터 줄
-  issues.strayPageNums = (md.match(/^[ \t]*-?\d{1,4}-?[ \t]*$/gm) || []).filter((l) => /\d/.test(l)).length;
+  // 4) 단독 페이지번호/푸터 줄. 단, 인접(이전/다음 비공백) 줄이 표 행이거나 또 다른 단독 숫자면
+  //    (차트값 군집 또는 깨진 표에서 튕겨나온 셀) 데이터로 보고 제외 — 진짜 고립 페이지번호만 센다.
+  const isBareNum = (l) => /^[ \t]*-?\d{1,4}-?[ \t]*$/.test(l) && /\d/.test(l);
+  const isTableish = (l) => /^[ \t]*(?:\||<\/?(?:table|tr|td|th)\b)/i.test(l);
+  let stray = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (!isBareNum(lines[i])) continue;
+    let prev = ""; for (let j = i - 1; j >= 0; j--) if (lines[j].trim()) { prev = lines[j]; break; }
+    let next = ""; for (let j = i + 1; j < lines.length; j++) if (lines[j].trim()) { next = lines[j]; break; }
+    if (!((prev && (isTableish(prev) || isBareNum(prev))) || (next && (isTableish(next) || isBareNum(next))))) stray++;
+  }
+  issues.strayPageNums = stray;
+
+  // 4b) 표 셀에 문장이 통째로 박힘 — 두 표가 한 페이지에서 하나의 <table> 로 뭉개지거나(인구동향
+  //     [표3]+[표4]), 비교표가 깨지며 산문이 셀로 들어간 신호. HTML 이 well-formed 라 기존 지표는
+  //     이를 0 으로 놓쳤다. 셀 텍스트가 한글 문장(종결/증감 표현)이거나 [그림/[표 캡션을 품으면 센다.
+  issues.sentenceInTableCell = (md.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) || []).filter((cell) => {
+    const text = cell.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (text.length < 30 || !/[가-힣]/.test(text)) return false;
+    return /(?:증가함|감소함|하였다|되었다|하였음|되었음|명으로|배 증가|배 감소)/.test(text) || /\[(?:그림|표)\s*\d/.test(text);
+  }).length;
 
   // 5) 빈/실패 마커
   issues.emptyMarkers = (md.match(/\[OCR 결과 없음\]|\[OCR\s*실패/g) || []).length;
@@ -44,9 +66,69 @@ export function scoreMarkdown(md) {
 
   const problemTotal =
     issues.brokenKoreanSpacing + issues.crammedTableRows + issues.codeFences +
-    issues.strayPageNums + issues.emptyMarkers + issues.bodyAsHeading;
+    issues.strayPageNums + issues.emptyMarkers + issues.bodyAsHeading +
+    issues.sentenceInTableCell;
 
-  return { chars: md.length, lines: lines.length, figures: figIdx.length, chartCoverage, issues, problemTotal };
+  // 청크 경계 완전성 — 변환 결함(problemTotal)과 별개의 정보성 신호라 따로 둔다.
+  const boundary = detectBoundaryIssues(md).flags;
+
+  return { chars: md.length, lines: lines.length, figures: figIdx.length, chartCoverage, issues, problemTotal, boundary };
+}
+
+// 청크 경계 완전성 검사 — 원문이 중간(조사/표/조문 미완)에서 잘렸는지 결정론적으로 감지한다.
+// 변환 실패는 아니지만 RAG 청크 품질에 중요한 신호라 경고로 표면화한다. (pipeline.md 2.1 참고)
+// 반환: { flags: {0|1}, warnings: [{code, message}] }. scoreMarkdown 은 flags 를, convert 는 warnings 를 쓴다.
+const JOSA_TAIL_RE = /(?:을|를|이|가|은|는|와|과|의|에|에서|에게|으로|로|및|또는|이나|거나|하고|하며|하여|부터|까지|보다|라며|라고|면서|지만|는데|으며|며)$/;
+const OPEN_BRACKET_RE = /[([{（［｛「『]$/;
+const LIST_MARKER_RE = /[①-⑮㉠-㉭]|(?:^|\s)\d+\s*\.|(?:^|\s)[가-하]\s*\.|(?:^|\n)\s*[-*]\s/;
+
+export function detectBoundaryIssues(md, filename = "") {
+  const text = String(md || "");
+  const flags = { danglingSentence: 0, unclosedTable: 0, statuteCutoff: 0, pageRangeChunk: 0 };
+  const warnings = [];
+
+  // 마지막 비어있지 않은 줄(장식 기호 꼬리는 떼고 본문 끝 글자로 판정).
+  const lines = text.split("\n");
+  let last = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].replace(/[ \t>#*`~_]+$/g, "").trim();
+    if (t) { last = t; break; }
+  }
+
+  // (a) 문장 미완 — 마지막 줄이 조사/접속어미·쉼표·콜론·열린 괄호로 끝남(표 구분행 제외).
+  const isSep = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(last);
+  if (last && !isSep && (JOSA_TAIL_RE.test(last) || /[,;:·،]$/.test(last) || OPEN_BRACKET_RE.test(last))) {
+    flags.danglingSentence = 1;
+    warnings.push({ code: "INCOMPLETE_TAIL", message: `문서가 문장 중간에서 끝남(말미: "${last.slice(-24)}") — 청크 경계에서 잘렸을 수 있음` });
+  }
+
+  // (b) 표 미완 — HTML <table> 개폐 불일치(표가 문서 끝에서 잘림).
+  const opens = (text.match(/<table\b/gi) || []).length;
+  const closes = (text.match(/<\/table\s*>/gi) || []).length;
+  if (opens !== closes) {
+    flags.unclosedTable = 1;
+    warnings.push({ code: "UNCLOSED_TABLE", message: `HTML <table> 가 닫히지 않음(open ${opens} / close ${closes}) — 표가 문서 끝에서 잘렸을 수 있음` });
+  }
+
+  // (c) 조문 미완 — '다음 각 호/목' 뒤 목록 없음, 또는 마지막 줄이 조/항/호 머리뿐.
+  const tail = text.slice(-220);
+  const afterEach = tail.split(/다음\s*각\s*[호목]/);
+  if (afterEach.length > 1 && !LIST_MARKER_RE.test(afterEach[afterEach.length - 1])) {
+    flags.statuteCutoff = 1;
+    warnings.push({ code: "STATUTE_CUTOFF", message: "'다음 각 호' 뒤 목록 없이 끝남 — 본문이 잘렸을 수 있음" });
+  } else if (/(?:^|\n)\s*제\s*\d+\s*[조항호](?:\s*\([^)\n]*\))?\s*$/.test(text)) {
+    flags.statuteCutoff = 1;
+    warnings.push({ code: "STATUTE_CUTOFF", message: "조/항/호 머리만 있고 본문 없이 끝남 — 본문이 잘렸을 수 있음" });
+  }
+
+  // (d) 파일명이 페이지 구간 청크 패턴(...-N-M.ext, M>=N) — 원문 일부일 가능성.
+  const m = String(filename || "").match(/-(\d+)-(\d+)\.[A-Za-z0-9]+$/);
+  if (m && Number(m[2]) >= Number(m[1])) {
+    flags.pageRangeChunk = 1;
+    warnings.push({ code: "PAGE_RANGE_CHUNK", message: `파일명이 페이지 구간 청크(${m[1]}-${m[2]}) 패턴 — 원문 일부일 수 있음(전체성 보장 안 됨)` });
+  }
+
+  return { flags, warnings };
 }
 
 // CLI
@@ -60,4 +142,9 @@ if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
   console.log(`  문제 총합: ${s.problemTotal}`);
   for (const [k, v] of Object.entries(s.issues)) if (v) console.log(`    - ${k}: ${v}`);
   if (s.problemTotal === 0) console.log("  ✅ 주요 품질 문제 없음");
+  const { warnings } = detectBoundaryIssues(md, path);
+  if (warnings.length) {
+    console.log(`  ⚠ 경계 경고 ${warnings.length}건:`);
+    for (const w of warnings) console.log(`    - [${w.code}] ${w.message}`);
+  }
 }

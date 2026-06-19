@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
-    "test": "node tests/detect.test.mjs && node tests/provider.test.mjs && node tests/enrich-format.test.mjs && node tests/eval.test.mjs",
+    "test": "node tests/detect.test.mjs && node tests/chart-fix.test.mjs && node tests/comparison-table.test.mjs && node tests/postprocess.test.mjs && node tests/reflow.test.mjs && node tests/ocr-table.test.mjs && node tests/provider.test.mjs && node tests/enrich-format.test.mjs && node tests/boundary.test.mjs && node tests/flowchart.test.mjs && node tests/eval.test.mjs",
     "test:detect": "node tests/detect-precision.mjs",
     "test:accuracy": "node tests/accuracy.mjs"
   },
@@ -18,8 +18,9 @@
     "@hono/swagger-ui": "^0.6.1",
     "@napi-rs/canvas": "^1.0.0",
     "canvas": "^3.2.3",
+    "glyf": "^0.2.0",
     "hono": "^4.12.21",
-    "kordoc": "^3.0.1",
+    "kordoc": "^3.1.1",
     "mupdf": "^1.27.0",
     "pdfjs-dist": "^4.10.38"
   }

@@ -7,25 +7,33 @@ import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-r
 import { fromIni } from "@aws-sdk/credential-providers";
 
 function openaiChatParse(json) {
-  return json?.choices?.[0]?.message?.content?.trim() || "";
+  const msg = json?.choices?.[0]?.message;
+  // reasoning 모델(Qwen3.6 등)은 enable_thinking=false 면 답이 content 로 나온다. 다만 일부
+  // 템플릿/서버 설정에선 content 가 비고 reasoning_content 로만 채워질 수 있어, content 가
+  // 비었을 때만 reasoning_content 로 방어적 폴백(정상 경로에선 reasoning_content 는 비어 무해).
+  return msg?.content?.trim() || msg?.reasoning_content?.trim() || "";
 }
 
 // 로컬 vLLM (OpenAI 호환). thinking 켜면 사고 토큰이 답을 다 먹어 비므로 기본 OFF.
-// system 메시지 지원: OCR 공통 지시문을 byte 동일하게 맨 앞에 보내 prefix cache 를 살린다.
-// 샘플링 파라미터(topP 등)는 명시된 것만 body 에 포함 — 서버 기본값(채팅용 0.6/1.1)이
-// 표·반복 텍스트 전사에 부적합해 추출 호출에서 명시적으로 덮어쓴다.
+// system 메시지 지원: OCR 공통 지시문을 맨 앞 system 으로 보낸다. ⚠ qwen3.6-27b 는 하이브리드
+// Mamba/GDN 구조라 vLLM prefix-cache 적중이 사실상 0% — 캐시로 prefill 을 아낄 수 없으니, system
+// 지시문은 '간결하게' 유지할 것(매 호출 전부 재-prefill 되므로 길수록 매번 손해). 묶음 요청(#1)만이
+// prefill 절감의 확실한 수단.
+// 샘플링 파라미터(topP 등)는 명시된 것만 body 에 포함 — 명시한 값은 서버의
+// override-generation-config 기본값을 덮어쓴다. (OCR 은 frequency_penalty 등으로 반복
+// 붕괴를 막으면서 표의 정상 반복은 허용 — OCR_SAMPLING in vllm.js 참고.)
 const vllmProvider = {
   id: "vllm",
   fields: ["url", "model", "thinking"],
   supportsSystem: true,
   defaults: () => ({
     url: process.env.VLLM_URL || "",
-    model: process.env.VLLM_MODEL || "qwen",
+    model: process.env.VLLM_MODEL || "qwen/qwen3.6-27b",
     thinking: process.env.VLLM_THINKING === "1",
   }),
   enabled: (cfg) => !!cfg.url && process.env.VLLM_DISABLED !== "1",
   info: (cfg) => ({ url: cfg.url, model: cfg.model, thinking: !!cfg.thinking }),
-  build(cfg, { system, prompt, text, image, maxTokens, temperature, topP, presencePenalty, repetitionPenalty }) {
+  build(cfg, { system, prompt, text, image, maxTokens, temperature, topP, presencePenalty, repetitionPenalty, frequencyPenalty }) {
     const content = [{ type: "text", text: prompt }];
     if (text) content.push({ type: "text", text });
     if (image) content.push({ type: "image_url", image_url: { url: image } });
@@ -42,6 +50,7 @@ const vllmProvider = {
     if (topP != null) body.top_p = topP;
     if (presencePenalty != null) body.presence_penalty = presencePenalty;
     if (repetitionPenalty != null) body.repetition_penalty = repetitionPenalty;
+    if (frequencyPenalty != null) body.frequency_penalty = frequencyPenalty;
     return {
       url: cfg.url,
       headers: { "Content-Type": "application/json" },
@@ -319,9 +328,33 @@ function runClaude(bin, args, timeoutMs) {
     child.on("error", (e) => { clearTimeout(timer); reject(e); });
     child.on("close", (code) => {
       clearTimeout(timer);
-      code !== 0 ? reject(new Error(`claude exited ${code}: ${err.slice(0, 300)}`)) : resolve(out);
+      code !== 0 ? reject(new Error(formatClaudeExit(code, out, err))) : resolve(out);
     });
   });
+}
+
+function formatClaudeExit(code, out, err) {
+  const parts = [];
+  const stdout = String(out || "").trim();
+  const stderr = String(err || "").trim();
+  if (stdout) {
+    try {
+      const json = JSON.parse(stdout);
+      const msg = [
+        json.result,
+        json.api_error_status,
+        json.subtype,
+        json.terminal_reason,
+        json.stop_reason,
+      ].filter(Boolean).join(" | ");
+      if (msg) parts.push(msg);
+    } catch {
+      parts.push(stdout);
+    }
+  }
+  if (stderr) parts.push(stderr);
+  const detail = parts.join(" | ").replace(/\s+/g, " ").slice(0, 600);
+  return `claude exited ${code}${detail ? `: ${detail}` : ""}`;
 }
 
 const claudeCliProvider = {
@@ -347,10 +380,19 @@ const claudeCliProvider = {
           promptText = `Read the image at ${imgPath} and ${prompt}`;
         }
       }
+      // --strict-mcp-config: 사용자 개인 MCP 서버(Gmail/Drive/Figma 등)를 0개만 로딩.
+      // 안 붙이면 매 OCR 호출마다 원격 MCP 전부에 연결을 시도해 startup 이 수초~행으로 늘어난다
+      // (인증 필요한 서버는 timeout 까지 블록 → "호출 자체가 안 되는" 것처럼 보임). OCR 은 MCP 불필요.
       const args = ["-p", promptText, "--model", cfg.model,
-        "--output-format", "json", "--permission-mode", "bypassPermissions"];
+        "--output-format", "json", "--permission-mode", "bypassPermissions",
+        "--strict-mcp-config"];
       if (imgPath) args.push("--allowedTools", "Read");
-      const stdout = await runClaude(resolveClaudeBin(), args, timeoutMs || cfg.timeout_ms);
+      // OCR 경로는 timeoutMs=240s(vLLM 기준)를 넘겨오지만, claude -p 는 매 호출이 에이전트를
+      // cold-boot 하는 데다 간헐적으로 행이 걸려 한 호출이 240s 를 다 태우면 4분간 멈춘 것처럼
+      // 보인다. claude 전용 상한(cfg.timeout_ms, 기본 120s)으로 클램프 — 정상 페이지 OCR 은
+      // ~36s 라 120s 면 충분하고, 행은 절반 시간에 끊어 사용자 대기를 줄인다.
+      const limitMs = Math.min(timeoutMs || cfg.timeout_ms, cfg.timeout_ms);
+      const stdout = await runClaude(resolveClaudeBin(), args, limitMs);
       const json = JSON.parse(stdout);
       if (json.is_error) throw new Error(json.result || "claude cli error");
       return (json.result || "").trim();
@@ -438,6 +480,139 @@ const codexCliProvider = {
   pingPrompt: "Reply with the single word: ping",
 };
 
+// MinerU 문서 파싱 REST API. OpenAI 호환 chat 이 아니라 — 파일을 multipart 로 통째 업로드하면
+// 서버 파이프라인(레이아웃+OCR+표+읽기순서)이 한 번에 markdown 으로 변환한다. 그래서 페이지 단위
+// build/parse/complete 대신 '파일 단위' parseDocument 를 쓰고(kind:"document-parser"), convert.js 가
+// 이 엔진을 만나면 kordoc/reflow/enrich 파이프라인을 통째 우회한다. (HWP/HWPX 는 MinerU 가 못 먹으니
+// PDF·이미지·DOCX 위주 — 그 외 포맷은 기존 vllm 파이프라인을 쓸 것.)
+function mineruEndpoint(url, path) {
+  // 사용자가 base(http://host:8000) 또는 풀 경로(.../file_parse)를 넣을 수 있으니 정규화.
+  const root = String(url || "").replace(/\/+$/, "").replace(/\/file_parse$/, "");
+  return `${root}${path}`;
+}
+
+const MINERU_FILE_MIME = {
+  pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  webp: "image/webp", gif: "image/gif", bmp: "image/bmp", tif: "image/tiff", tiff: "image/tiff",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+};
+function mineruMime(filename) {
+  const ext = String(filename || "").split(".").pop().toLowerCase();
+  return MINERU_FILE_MIME[ext] || "application/octet-stream";
+}
+
+const MINERU_IMAGE_EXT = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"]);
+function isMineruImage(filename) {
+  return MINERU_IMAGE_EXT.has(String(filename || "").split(".").pop().toLowerCase());
+}
+
+// MinerU 는 백엔드가 둘이고 OCR 특성이 정반대다(서버 가이드 MINERU_API.md):
+//  · hybrid-engine(VLM, :8000) — 복잡한 표/다단/수식엔 강하나 '스타일·장식 폰트' 이미지에서
+//    글자 깨짐·한→일 언어 드리프트·환각·`#/##` 오삽입(고질병). lang_list 거의 무시.
+//  · pipeline(PaddleOCR 계열, :8002) — lang_list=korean 이 실제 적용돼 한글 전사가 정확. 포스터/
+//    배너/장식 폰트에 강함. 복잡한 표/레이아웃은 약함.
+// 그래서 파일·설정으로 (backend, baseUrl)을 라우팅한다. auto: 이미지=pipeline, 그 외(PDF/DOCX)=hybrid.
+// (export 는 단위 테스트용 — 네트워크 없이 라우팅만 검증.)
+export function mineruRoute(filename, cfg) {
+  let backend = cfg.backend || "auto";
+  if (backend === "auto") backend = isMineruImage(filename) ? "pipeline" : "hybrid-engine";
+  let base = backend === "pipeline" ? cfg.pipeline_url : cfg.url;
+  // 원하는 백엔드의 서버 URL 이 비어 있으면, 설정된 다른 서버로 폴백하고 backend 도 그에 맞춘다
+  // (pipeline 백엔드를 hybrid 서버로 보내면 CUDA error 로 죽으므로 backend 값을 서버와 일치시킨다).
+  if (!base) {
+    base = cfg.url || cfg.pipeline_url;
+    backend = base && base === cfg.pipeline_url ? "pipeline" : "hybrid-engine";
+  }
+  return { backend, base };
+}
+
+const mineruProvider = {
+  id: "mineru",
+  kind: "document-parser", // 페이지 단위 completer 가 아니라 파일 단위 파서 — convert 가 파이프라인 우회.
+  fields: ["url", "pipeline_url", "backend", "lang", "parse_method", "effort", "table", "formula", "image_analysis", "postprocess", "timeout_ms"],
+  defaults: () => ({
+    url: process.env.MINERU_URL || "",                     // hybrid-engine(VLM, :8000) — 복잡 표/다단/PDF
+    pipeline_url: process.env.MINERU_PIPELINE_URL || "",   // pipeline(PaddleOCR, :8002) — 이미지/포스터/한글 정확
+    backend: process.env.MINERU_BACKEND || "auto",         // auto | hybrid-engine | pipeline
+    lang: process.env.MINERU_LANG || "korean",
+    parse_method: process.env.MINERU_PARSE_METHOD || "auto",
+    effort: process.env.MINERU_EFFORT || "",               // ""(미전송) | low | medium | high
+    table: process.env.MINERU_TABLE !== "0",
+    formula: process.env.MINERU_FORMULA !== "0",
+    image_analysis: process.env.MINERU_IMAGE_ANALYSIS === "1",
+    // 육안 점검 기본은 MinerU '원본' md 그대로 — 우리 postprocess 를 끼우면 비교가 흐려진다. 1 로 켜면 적용.
+    postprocess: process.env.MINERU_POSTPROCESS === "1",
+    timeout_ms: Number(process.env.MINERU_TIMEOUT_MS || 600_000),
+  }),
+  enabled: (cfg) => !!(cfg.url || cfg.pipeline_url) && process.env.MINERU_DISABLED !== "1",
+  info: (cfg) => ({
+    hybrid: cfg.url ? mineruEndpoint(cfg.url, "/file_parse") : null,
+    pipeline: cfg.pipeline_url ? mineruEndpoint(cfg.pipeline_url, "/file_parse") : null,
+    backend: cfg.backend,
+    lang: cfg.lang,
+  }),
+  // chat completer 가 아니므로 aiPing 은 /health 로 점검한다(아래 ai.js 가 provider.ping 우선 사용).
+  async ping(cfg) {
+    const url = mineruEndpoint(cfg.url || cfg.pipeline_url, "/health");
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 10_000);
+    try {
+      const resp = await fetch(url, { signal: ac.signal });
+      if (!resp.ok) throw new Error(`MinerU /health HTTP ${resp.status}`);
+      return { text: "healthy", url };
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+  // 파일 통째 업로드 → { markdown, pageCount, metadata }. convert.js 의 documentParserConvert 가 호출.
+  async parseDocument(cfg, { buffer, filename, onPhase = () => {} }) {
+    // 이미지=pipeline(:8002, 한글 정확) / PDF·DOCX=hybrid-engine(:8000, 복잡 표) 로 라우팅.
+    const { backend, base } = mineruRoute(filename, cfg);
+    if (!base) throw new Error("MinerU URL 미설정 (MINERU_URL / MINERU_PIPELINE_URL)");
+    const url = mineruEndpoint(base, "/file_parse");
+    const form = new FormData();
+    form.append("files", new Blob([buffer], { type: mineruMime(filename) }), filename || "document.pdf");
+    form.append("backend", backend);
+    form.append("lang_list", cfg.lang);
+    form.append("parse_method", cfg.parse_method);
+    if (cfg.effort) form.append("effort", cfg.effort);
+    form.append("table_enable", String(!!cfg.table));
+    form.append("formula_enable", String(!!cfg.formula));
+    form.append("image_analysis", String(!!cfg.image_analysis));
+    form.append("return_md", "true");
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), cfg.timeout_ms);
+    let resp;
+    try {
+      onPhase({ phase: "parse", message: `MinerU(${backend}) 업로드 → ${url}` });
+      resp = await fetch(url, { method: "POST", body: form, signal: ac.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => "");
+      const err = new Error(`MinerU HTTP ${resp.status} ${detail.slice(0, 300)}`);
+      err.status = resp.status;
+      throw err;
+    }
+    const data = await resp.json();
+    if (data.status && data.status !== "completed") {
+      throw new Error(`MinerU 파싱 실패: status=${data.status} error=${data.error || ""}`);
+    }
+    const fname = data.file_names?.[0];
+    const md = (fname && data.results?.[fname]?.md_content) || data.md_content || "";
+    if (!md) throw new Error("MinerU 응답에 md_content 가 없음");
+    return {
+      markdown: md,
+      pageCount: null,
+      metadata: { source: "mineru", backend: data.backend || backend, version: data.version, file: fname },
+    };
+  },
+  pingPrompt: "health",
+};
+
 export const PROVIDERS = {
   vllm: vllmProvider,
   openai: openaiProvider,
@@ -447,8 +622,9 @@ export const PROVIDERS = {
   codex: codexProvider,
   "claude-cli": claudeCliProvider,
   "codex-cli": codexCliProvider,
+  mineru: mineruProvider,
 };
 
 export const PROVIDER_ALIASES = { claude_cli: "claude-cli", codex_cli: "codex-cli" };
 
-export const PROVIDER_CHOICES = ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli"];
+export const PROVIDER_CHOICES = ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli", "mineru"];

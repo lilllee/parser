@@ -5,6 +5,7 @@ import { serve } from "@hono/node-server";
 import { swaggerUI } from "@hono/swagger-ui";
 import { pathToFileURL } from "node:url";
 import { runConvert } from "./convert.js";
+import { markdownTablesToHtml } from "./postprocess.js";
 import { resolveAiConfig } from "./ai.js";
 import { checkVllmConnection, vllmInfo, VLLM_ENABLED } from "./vllm.js";
 import { openapiSpec } from "./openapi.js";
@@ -50,9 +51,13 @@ app.post("/api/convert", async (c) => {
     `[convert] ${filename} (${(arrayBuffer.byteLength / 1024).toFixed(1)} KB) · provider=${aiConfig.id}`
   );
 
+  // 출력 표 포맷: md(기본, 사람/RAG 가독) | html(<table>, 구조보존·ParseBench GRITS 등).
+  const format = String(body.format || body.output_format || "md").toLowerCase() === "html" ? "html" : "md";
+
   try {
     const result = await runConvert(arrayBuffer, filename, {}, aiConfig);
-    return c.json({ ok: true, ...result, elapsedMs: elapsedMs() });
+    const markdown = format === "html" ? markdownTablesToHtml(result.markdown || "") : result.markdown;
+    return c.json({ ok: true, ...result, markdown, format, elapsedMs: elapsedMs() });
   } catch (e) {
     console.error("[convert] 실패:", e);
     return c.json({ ok: false, error: e?.message || String(e), code: e?.code, elapsedMs: elapsedMs() }, 500);

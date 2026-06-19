@@ -49,8 +49,9 @@ AI 백엔드는 요청마다 `provider` 로 고른다(미지정 시 `vllm`). 설
 |---|---|---|
 | `vllm` (기본) | `url` · `model` · `thinking` | 로컬 vLLM (OpenAI 호환) |
 | `openai` | `api_key` · `model` · `base_url` | OpenAI / OpenAI 호환 |
-| `gemini` | `api_key` · `model` · `base_url` | Google Gemini |
+| `gemini` | `api_key` · `model` · `base_url` | Google Gemini native generateContent |
 | `anthropic` | `api_key` · `model` · `base_url` | Anthropic Claude |
+| `bedrock` | `region` · `model` · `profile` · `access_key_id` · `secret_access_key` · `session_token` | AWS Bedrock Converse |
 | `claude_cli` | `model` | Claude Max (`claude -p` CLI) |
 | `codex_cli` | `model` | ChatGPT Pro (`codex exec` CLI) |
 
@@ -65,6 +66,7 @@ AI 백엔드는 요청마다 `provider` 로 고른다(미지정 시 `vllm`). 설
 
 - `AI_PROVIDER` — 기본 provider (`vllm` 등)
 - `VLLM_URL` · `VLLM_MODEL` — 로컬 vLLM
+- `BEDROCK_REGION` · `BEDROCK_MODEL` · `BEDROCK_PROFILE` — AWS Bedrock Converse
 - `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` — 외부 provider 키
 
 전체 옵션은 `.env` 인라인 주석을, 변환 파이프라인 내부 동작은 [`pipeline.md`](./pipeline.md) 를 참고한다.
