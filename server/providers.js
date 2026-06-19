@@ -15,10 +15,8 @@ function openaiChatParse(json) {
 }
 
 // 로컬 vLLM (OpenAI 호환). thinking 켜면 사고 토큰이 답을 다 먹어 비므로 기본 OFF.
-// system 메시지 지원: OCR 공통 지시문을 맨 앞 system 으로 보낸다. ⚠ qwen3.6-27b 는 하이브리드
-// Mamba/GDN 구조라 vLLM prefix-cache 적중이 사실상 0% — 캐시로 prefill 을 아낄 수 없으니, system
-// 지시문은 '간결하게' 유지할 것(매 호출 전부 재-prefill 되므로 길수록 매번 손해). 묶음 요청(#1)만이
-// prefill 절감의 확실한 수단.
+// system 메시지 지원: OCR 공통 지시문을 맨 앞 system 으로 보낸다. system 지시문은 '간결하게' 유지할 것
+// (prefix-cache 이득은 모델/서버 구성에 따라 다르므로 의존하지 말고, 묶음 요청이 prefill 절감의 확실한 수단).
 // 샘플링 파라미터(topP 등)는 명시된 것만 body 에 포함 — 명시한 값은 서버의
 // override-generation-config 기본값을 덮어쓴다. (OCR 은 frequency_penalty 등으로 반복
 // 붕괴를 막으면서 표의 정상 반복은 허용 — OCR_SAMPLING in vllm.js 참고.)
@@ -28,7 +26,7 @@ const vllmProvider = {
   supportsSystem: true,
   defaults: () => ({
     url: process.env.VLLM_URL || "",
-    model: process.env.VLLM_MODEL || "qwen/qwen3.6-27b",
+    model: process.env.VLLM_MODEL || "Intel/Qwen3.5-122B-A10B-int4-AutoRound",
     thinking: process.env.VLLM_THINKING === "1",
   }),
   enabled: (cfg) => !!cfg.url && process.env.VLLM_DISABLED !== "1",

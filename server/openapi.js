@@ -1,7 +1,7 @@
 // OpenAPI 스펙 (/api/openapi.json · Swagger UI /api/docs). ConvertRequest 의 vllm 기본값은 .env 값.
 
 const VLLM_URL_DEFAULT = process.env.VLLM_URL || "http://localhost:8000/v1/chat/completions";
-const VLLM_MODEL_DEFAULT = process.env.VLLM_MODEL || "qwen/qwen3.6-27b";
+const VLLM_MODEL_DEFAULT = process.env.VLLM_MODEL || "Intel/Qwen3.5-122B-A10B-int4-AutoRound";
 const MINERU_URL_DEFAULT = process.env.MINERU_URL || "http://localhost:8000";
 const VLLM_THINKING_DEFAULT = process.env.VLLM_THINKING === "1";
 const BEDROCK_REGION_DEFAULT = process.env.BEDROCK_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
