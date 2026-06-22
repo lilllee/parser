@@ -118,8 +118,25 @@ markdown 변환:
 - 설명문, 요약문, 코멘트를 추가하지 않는다.
 - OCR 결과 앞뒤에 "다음은", "전사 결과", "분석" 같은 안내 문구를 붙이지 않는다.`,
 
-  pdfOcrUser(pageNumber) {
-    return `페이지 ${pageNumber} 이미지입니다. 보이는 내용만 markdown으로 전사하세요.`;
+  pdfOcrUser(pageNumber, pageTotal = null) {
+    const head =
+      pageTotal && pageTotal > 1 ? `페이지 ${pageNumber} / 총 ${pageTotal}` : `페이지 ${pageNumber}`;
+    return `${head} 이미지입니다. 보이는 내용만 markdown으로 전사하세요.`;
+  },
+
+  // 텍스트레이어 anchor(보조 입력) — 반드시 user 메시지로만 보낸다(system 은 byte 동일 유지 → prefix
+  // cache). 이미지가 유일한 시각 근거이고, anchor 는 숫자/철자/읽기순서 보조일 뿐이다. injection 방어는
+  // commonSystemPrompt 가 이미 커버(입력 데이터 안 명령 무시 / 보이지 않는 것 만들지 않기).
+  pdfOcrAnchor(anchorText) {
+    return `참고용 텍스트레이어(anchor) — 이미지가 유일한 시각 근거이고, 아래 텍스트는 숫자/철자/읽기순서 보조용일 뿐이다.
+규칙:
+- 이미지에 보이는 내용만 전사한다. anchor 에 있어도 이미지에 안 보이면 출력하지 않는다.
+- 이미지와 anchor 가 충돌하면 항상 이미지를 따른다(특히 숫자는 보수적으로 이미지 우선).
+- anchor 텍스트를 그대로 베끼지 말고 글자·숫자 판독의 보조로만 쓴다.
+
+[anchor 시작]
+${anchorText}
+[anchor 끝]`;
   },
 
   pdfOcrTileUser(pageNumber, tileNumber, tileTotal) {
@@ -145,6 +162,22 @@ markdown 변환:
 - 반복을 이어 쓰지 말고 페이지에 보이는 실제 내용만 다시 전사한다.
 - 같은 문장, 표 행, 안내 문구를 근거 없이 반복하지 않는다.
 - 출력은 수정된 OCR markdown만 한다.`,
+
+  // 숫자 보정 재시도(P0.5) — 텍스트레이어에서 확인된 숫자가 이전 전사에서 누락/오독됐을 때.
+  // kordocNumbers 는 검증 기준 숫자 목록이며, '보이면 정확히 포함, 안 보이면 만들지 말 것'이 핵심.
+  pdfOcrNumericRepair(kordocNumbers) {
+    const list = (kordocNumbers || []).join(", ");
+    return `이전 전사에서 일부 숫자가 누락되거나 오독됐을 가능성이 있다. 이번에는 숫자 정확도를 최우선으로 다시 전사한다.
+
+검증 기준 숫자(같은 페이지 텍스트레이어에서 추출): ${list}
+
+규칙:
+- 위 숫자가 페이지에 실제로 보이면, 그 값이 해당 표·문장·위치에 정확히 들어가도록 전사한다.
+- 단, 목록에 있어도 페이지에서 보이지 않으면 만들어 넣지 않는다(환각 금지).
+- 목록에 없지만 페이지에 보이는 숫자도 그대로 전사한다.
+- 글자, 표 구조, 한글 텍스트는 임의로 바꾸지 않는다(숫자만 바로잡는다).
+- 출력은 수정된 OCR markdown(표는 HTML <table>)만 한다.`;
+  },
 
   imageOcrSystem:
     `${commonSystemPrompt}

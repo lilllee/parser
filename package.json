@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
-    "test": "node tests/detect.test.mjs && node tests/chart-fix.test.mjs && node tests/comparison-table.test.mjs && node tests/postprocess.test.mjs && node tests/reflow.test.mjs && node tests/ocr-table.test.mjs && node tests/provider.test.mjs && node tests/enrich-format.test.mjs && node tests/boundary.test.mjs && node tests/flowchart.test.mjs && node tests/eval.test.mjs",
+    "test": "node tests/detect.test.mjs && node tests/chart-fix.test.mjs && node tests/comparison-table.test.mjs && node tests/postprocess.test.mjs && node tests/reflow.test.mjs && node tests/ocr-table.test.mjs && node tests/provider.test.mjs && node tests/enrich-format.test.mjs && node tests/boundary.test.mjs && node tests/flowchart.test.mjs && node tests/anchor.test.mjs && node tests/eval.test.mjs",
     "test:detect": "node tests/detect-precision.mjs",
     "test:accuracy": "node tests/accuracy.mjs"
   },
