@@ -194,8 +194,8 @@ export const openapiSpec = {
           },
           force_ocr: {
             type: "boolean",
-            default: false,
-            description: "true 면 kordoc 을 건너뛰고 PDF 모든 페이지를 vision OCR 로 직접 전사(+postprocess·enrich). kordoc 이 dense 한 한국어 표를 열 뜯김/표→산문/공백오염으로 망치는 정부문서 등에 권장. 추가로 페이지별 숫자 검증을 수행 — kordoc 텍스트레이어 숫자와 대조해 vision 오독 의심 페이지를 metadata.verification 과 NUMERIC_MISMATCH 경고로 표면화한다(출력은 vision 유지). vision provider(vllm/bedrock/anthropic) 필요. mineru provider 에는 무효. (mode=vision 으로도 켜짐)",
+            default: /^(1|true|on|yes)$/i.test(process.env.FORCE_OCR || ""),
+            description: "PDF 를 kordoc 우회하고 전체페이지 vision OCR 로 전사(+postprocess·차트 enrich·페이지별 숫자검증). 미지정 시 서버 기본값(FORCE_OCR env)을 따르고, 지정하면 그 값이 우선(false 로 끄기도 가능). ⚠ 적용 대상: PDF 만 — HWP/HWPX/DOCX 는 자동 제외돼 kordoc 전처리를 거치고, 이미지는 원래부터 vision 이다. 숫자검증은 kordoc 텍스트레이어 숫자와 대조해 vision 오독 의심 페이지를 metadata.verification·NUMERIC_MISMATCH 경고로 표면화(출력은 vision 유지). 컨텍스트 초과 페이지는 1024 단일뷰→그리드타일(DeepSeek) 폴백. vision provider(vllm/bedrock/anthropic) 필요, mineru 엔 무효. (mode=vision 으로도 켜짐)",
           },
           api_key: {
             type: "string",

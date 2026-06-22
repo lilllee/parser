@@ -598,8 +598,12 @@ Golden Markdown을 사람이 별도로 저장한 경우에만 자동 metrics 계
 | `VLLM_CONCURRENCY` | `3` | enrich 동시성 |
 | `VLLM_OCR_CONCURRENCY` | `3` | OCR 동시성 |
 | `VLLM_OCR_TIMEOUT_MS` | `240000` | OCR 1건 타임아웃 |
-| `VLLM_OCR_RENDER_SCALE` | `2` | PDF 렌더 배율 |
-| `VLLM_OCR_MAX_LONG_SIDE` | `2200` | 렌더 이미지 긴 변 상한 |
+| `VLLM_OCR_RENDER_SCALE` | `3` | PDF 렌더 배율 |
+| `VLLM_OCR_MAX_LONG_SIDE` | `2600` | 렌더 이미지 긴 변 상한 |
+| `VLLM_OCR_TILE_FALLBACK` | on | 컨텍스트 초과 시 페이지를 타일로 나눠 OCR |
+| `VLLM_OCR_MIN_TILES` | `2` | 타일 fallback 최소 타일 수 |
+| `VLLM_OCR_MAX_TILES` | `6` | 타일 fallback 최대 타일 수 |
+| `VLLM_OCR_TILE_OVERLAP_PX` | `48` | 타일 경계 글자 잘림 방지용 overlap |
 | `VLLM_SPREAD_SPLIT` | on | `0`이면 펼침면 분할 감지/처리 비활성 |
 | `VLLM_TABLE_ANALYSIS` | off | `1`이면 Markdown 표 enrich 활성 |
 | `VLLM_PAGE_VISUAL` | on | `0`이면 page visual enrich 비활성 |

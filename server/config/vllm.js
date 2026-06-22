@@ -25,6 +25,15 @@ export const vllmConfig = Object.freeze({
       // 너무 크면 컨텍스트 초과 → ocrPageAdaptive 가 0.7배로 자동 축소 재시도.
       ocrScale: Number(process.env.VLLM_OCR_RENDER_SCALE || 3),
       ocrMaxLongSidePx: Number(process.env.VLLM_OCR_MAX_LONG_SIDE || 2600),
+      // DeepSeek-OCR 의 crop_mode 처럼, 큰 페이지가 컨텍스트 초과로 실패하면 축소만 하지 않고
+      // 읽기 순서 타일로 나눠 OCR 한다. 끄려면 VLLM_OCR_TILE_FALLBACK=0.
+      ocrTileFallback: process.env.VLLM_OCR_TILE_FALLBACK !== "0",
+      // DeepSeek-OCR 'Base'(1024) 모드: 컨텍스트 초과 페이지를 그리드 타일 전에 1024 긴변 단일 뷰로
+      // 먼저 OCR(스티칭/이음새 중복 없는 깨끗한 단일 패스 — 대부분의 '큰' 페이지는 이걸로 해결).
+      ocrBaseViewPx: Number(process.env.VLLM_OCR_BASE_VIEW_PX || 1024),
+      ocrMinTiles: Number(process.env.VLLM_OCR_MIN_TILES || 2),
+      ocrMaxTiles: Number(process.env.VLLM_OCR_MAX_TILES || 6),
+      ocrTileOverlapPx: Number(process.env.VLLM_OCR_TILE_OVERLAP_PX || 48),
     },
     features: {
       pageVisual: process.env.VLLM_PAGE_VISUAL !== "0",

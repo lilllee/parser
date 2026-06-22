@@ -55,9 +55,13 @@ app.post("/api/convert", async (c) => {
   const format = String(body.format || body.output_format || "md").toLowerCase() === "html" ? "html" : "md";
 
   // 강제 전체페이지 vision OCR (kordoc 우회). dense 표를 kordoc 이 산산조각 내는 PDF용. vision provider 필요.
-  const forceOcr =
-    /^(1|true|on|yes)$/i.test(String(body.force_ocr ?? body.ocr ?? "")) ||
-    String(body.mode || "").toLowerCase() === "vision";
+  // 우선순위: 요청 명시(force_ocr/ocr/mode=vision) > 서버 기본(FORCE_OCR env). 셋 다 없으면 false.
+  // 적용 대상은 convert 가 결정 — PDF 만 force(이미지는 별도 vision 경로, HWP/HWPX/DOCX 는 kordoc 유지).
+  const boolOf = (v) => (v == null || String(v).trim() === "" ? undefined : /^(1|true|on|yes)$/i.test(String(v)));
+  let reqForce = boolOf(body.force_ocr);
+  if (reqForce === undefined) reqForce = boolOf(body.ocr);
+  if (reqForce === undefined && String(body.mode || "").toLowerCase() === "vision") reqForce = true;
+  const forceOcr = reqForce ?? (boolOf(process.env.FORCE_OCR) ?? false);
 
   try {
     const result = await runConvert(arrayBuffer, filename, { forceOcr }, aiConfig);

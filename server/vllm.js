@@ -253,6 +253,7 @@ function findTargets(md, imageMap, visualPages) {
 async function analyzeTarget(t, imageMap) {
   if (t.type === "flowchart") {
     const out = await aiCall({
+      system: prompts.commonSystem,
       prompt: prompts.flowchartToMermaid,
       text: t.text,
       maxTokens: cfg.tokens.pageVisual,
@@ -263,7 +264,7 @@ async function analyzeTarget(t, imageMap) {
   if (t.type === "image") {
     const url = t.imageUrl || imageMap.get(t.file) || imageMap.get(normalizeImageRef(t.file));
     if (!url) return null;
-    const out = await aiCall({ image: url, prompt: prompts.imageAnalysis });
+    const out = await aiCall({ image: url, system: prompts.commonSystem, prompt: prompts.imageAnalysis });
     // 로고·도장·서명·장식 등 정보성 없는 이미지는 삽입하지 않는다(거짓/잡음 블록 방지).
     if (!out || isNoVisualResponse(out)) return null;
     return out;
@@ -279,6 +280,7 @@ async function analyzeTarget(t, imageMap) {
         lines.slice(-8).join("\n");
     }
     return aiCall({
+      system: prompts.commonSystem,
       prompt: prompts.tableAnalysis,
       text,
       maxTokens: cfg.tokens.table,
@@ -287,6 +289,7 @@ async function analyzeTarget(t, imageMap) {
   if (t.type === "page-visual") {
     const out = await aiCall({
       image: t.imageUrl,
+      system: prompts.commonSystem,
       prompt: prompts.pageVisualAnalysis,
       text: prompts.pageVisualContext(t.context),
       maxTokens: cfg.tokens.pageVisual,
@@ -315,6 +318,9 @@ const OCR_SAMPLING = Object.freeze({
 // 복잡한 표(병합·중첩)에서 모델이 markdown 으로 표를 깨뜨리는 출력 신호. 결정적으로 감지해
 // 재시도한다 — 모델이 같은 페이지를 절반쯤은 올바른 HTML 로 그리므로 몇 번 재시도하면 수렴.
 const TABLE_MAX_RETRY = Number(process.env.VLLM_OCR_TABLE_RETRY ?? 2);
+const DEEPSEEK_EOS_RE = /<[\|｜]end[▁_\s-]*of[▁_\s-]*sentence[\|｜]>/gi;
+const DEEPSEEK_REF_DET_RE = /<\|ref\|>[\s\S]*?<\|\/ref\|><\|det\|>[\s\S]*?<\|\/det\|>/g;
+
 export function hasBrokenTable(text) {
   if (!text) return false;
   if (/\|[^\n|]*(?:row|col)span\s*=/i.test(text)) return true; // markdown 칸에 rowspan/colspan 텍스트 누출
@@ -333,6 +339,35 @@ export function hasBrokenTable(text) {
     if (block.filter(isSep).length >= 2) return true; // 구분행 2개+ = 하위표 흘러나옴
     const widths = block.filter((l) => !isSep(l)).map((l) => l.split("|").length);
     if (widths.length && Math.max(...widths) - Math.min(...widths) >= 2) return true; // 칸 수 불일치
+  }
+  return false;
+}
+
+// DeepSeek-OCR 는 logits processor 로 반복 토큰을 막는다. OpenAI 호환 HTTP provider 에서는
+// 같은 훅을 직접 주입할 수 없으므로, 반환 텍스트의 반복 붕괴를 감지해 재시도/격리한다.
+export function hasDegenerateRepeat(text) {
+  const t = String(text || "").trim();
+  if (t.length < 80) return false;
+  if (/([^\s])\1{80,}/.test(t)) return true;
+
+  const lines = t.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length >= 8);
+  if (lines.length >= 6) {
+    const counts = new Map();
+    for (const line of lines) counts.set(line, (counts.get(line) || 0) + 1);
+    const max = Math.max(...counts.values());
+    if (max >= 5 && max / lines.length >= 0.35) return true;
+  }
+
+  const compact = t.replace(/\s+/g, " ").slice(0, 20000);
+  for (const size of [24, 40, 80]) {
+    const counts = new Map();
+    for (let i = 0; i + size <= compact.length; i += Math.max(8, Math.floor(size / 2))) {
+      const piece = compact.slice(i, i + size);
+      if (!/[A-Za-z0-9가-힣]/.test(piece)) continue;
+      const n = (counts.get(piece) || 0) + 1;
+      if (n >= 5) return true;
+      counts.set(piece, n);
+    }
   }
   return false;
 }
@@ -478,12 +513,17 @@ export async function ocrImageBuffer(arrayBuffer, mimeType = "image/png") {
   return cleanOcrText(text);
 }
 
-// vision 모델이 답을 코드펜스로 감쌀 때 그 펜스 줄만 제거.
-function cleanOcrText(text) {
+// vision 모델이 답을 코드펜스로 감싸거나 DeepSeek grounding 태그를 섞을 때 결과 markdown 만 남긴다.
+export function cleanOcrText(text) {
   const t = String(text || "").trim();
   if (!t) return "";
   return t
     .replace(/^[ \t]*```[ \t]*(?:markdown|md)?[ \t]*$/gim, "")
+    .replace(DEEPSEEK_EOS_RE, "")
+    .replace(DEEPSEEK_REF_DET_RE, "")
+    .replace(/<\/?center>/gi, "")
+    .replace(/\\coloneqq/g, ":=")
+    .replace(/\\eqqcolon/g, "=:")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -705,11 +745,23 @@ function countTables(text) {
 // 본문에 흡수) 깨진 것으로 보고 재시도한다(사용자 사례: '26년 예산 표가 통째로 누락된 케이스).
 async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0) {
   let png = null;
+  let fullPng = null;
   let text = null;
-  // 1) 렌더 → OCR. 컨텍스트 초과(400)면 0.7배로 줄여 1회 재시도.
+  // 검증/디버그용: 컨텍스트 초과를 기다리지 않고 강제로 fallback 경로를 탄다.
+  // VLLM_OCR_FORCE_TILE=global → 1024 단일뷰만, =tile → 그리드 타일만, 그 외 truthy → global→tile.
+  const force = process.env.VLLM_OCR_FORCE_TILE;
+  if (force) {
+    const fp = renderer.renderPage(pageNum, 1);
+    if (force === "tile") return ocrPageTiled(fp, pageNum);
+    const g = await ocrPageGlobalView(fp, pageNum);
+    return g || ocrPageTiled(fp, pageNum);
+  }
+  // 1) 렌더 → OCR. 컨텍스트 초과(400)면 0.7배로 줄여 재시도하고, 그래도 넘치면
+  // DeepSeek-OCR crop_mode 처럼 페이지를 읽기 순서 타일로 나눠 OCR 한다.
   for (const factor of [1, 0.7]) {
     try {
       png = renderer.renderPage(pageNum, factor);
+      if (factor === 1) fullPng = png;
     } catch (e) {
       console.warn(`[render] page ${pageNum} failed:`, e?.message || e);
       return "";
@@ -722,18 +774,36 @@ async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0) {
         console.warn(`[vllm-ocr] page ${pageNum} 컨텍스트 초과 — 0.7배 축소 재시도`);
         continue;
       }
+      if (isContextOverflow(e) && cfg.render.ocrTileFallback) {
+        // DeepSeek 'Base'(1024) 단일뷰 먼저 — 스티칭/이음새 중복 없는 깨끗한 한 패스로 대부분 해결.
+        console.warn(`[vllm-ocr] page ${pageNum} 축소 후에도 컨텍스트 초과 — global 뷰(1024) 단일패스 시도`);
+        const g = await ocrPageGlobalView(fullPng || png, pageNum);
+        if (g) return g;
+        console.warn(`[vllm-ocr] page ${pageNum} global 뷰 실패/부족 — 그리드 타일(Gundam) OCR`);
+        return ocrPageTiled(fullPng || png, pageNum);
+      }
       console.warn(`[vllm-ocr] page ${pageNum} failed:`, e?.message || e);
       return "";
     }
   }
   if (text == null) return "";
   // 2) 표가 깨졌거나(병합/중첩을 markdown 으로 누름) 표를 빠뜨렸으면(개수 부족) 재시도.
-  const bad = (t) => hasBrokenTable(t) || (expectedTables > 0 && countTables(t) < expectedTables);
+  const bad = (t) => hasBrokenTable(t) || hasDegenerateRepeat(t) || (expectedTables > 0 && countTables(t) < expectedTables);
   for (let r = 0; r < TABLE_MAX_RETRY && bad(text); r++) {
-    const why = hasBrokenTable(text) ? "표 깨짐" : `표 누락(${countTables(text)}/${expectedTables})`;
+    const why = hasBrokenTable(text)
+      ? "표 깨짐"
+      : hasDegenerateRepeat(text)
+        ? "반복 출력"
+        : `표 누락(${countTables(text)}/${expectedTables})`;
     console.warn(`[vllm-ocr] page ${pageNum} ${why} 감지 — 재시도 ${r + 1}/${TABLE_MAX_RETRY}`);
     try {
-      const retry = await vllmOcrPageStrict(png, pageNum, "image/png", { temperature: 0.4 }, prompts.pdfOcrTableRetry);
+      const retry = await vllmOcrPageStrict(
+        png,
+        pageNum,
+        "image/png",
+        { temperature: 0.4, repetitionPenalty: Math.max(1.05, OCR_SAMPLING.repetitionPenalty || 1.0) },
+        hasDegenerateRepeat(text) ? prompts.pdfOcrRepeatRetry : prompts.pdfOcrTableRetry
+      );
       if (retry && !bad(retry)) return retry;
       if (retry && countTables(retry) > countTables(text)) text = retry; // 더 완전한 쪽 유지
     } catch (e) {
@@ -742,6 +812,123 @@ async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0) {
     }
   }
   return text;
+}
+
+// DeepSeek 'Base'(1024) 모드: 전체 페이지를 1024 긴변 단일 뷰로 다운스케일해 한 번에 OCR.
+// 그리드 타일과 달리 스티칭/이음새 중복이 없는 깨끗한 단일 패스라, '큰' 페이지의 컨텍스트 초과는
+// 대부분 이걸로 해결된다. 1024 에서도 작은 글자가 뭉개지거나 여전히 초과(또는 반복 붕괴)면 null → 타일로.
+async function ocrPageGlobalView(png, pageNum) {
+  try {
+    const small = await downscalePngLongSide(png, cfg.render.ocrBaseViewPx || 1024);
+    const t = await vllmOcrPageStrict(small, pageNum, "image/png");
+    return t && !hasDegenerateRepeat(t) ? t : null;
+  } catch (e) {
+    console.warn(`[vllm-ocr] page ${pageNum} global 뷰 실패:`, e?.message || e);
+    return null;
+  }
+}
+
+// 긴 변이 target 픽셀이 되도록 PNG 다운스케일(이미 작으면 그대로). canvas 로 처리.
+async function downscalePngLongSide(png, target) {
+  const img = await loadImage(png);
+  const long = Math.max(img.width, img.height);
+  if (long <= target) return png;
+  const scale = target / long;
+  const w = Math.max(1, Math.round(img.width * scale));
+  const h = Math.max(1, Math.round(img.height * scale));
+  const c = createCanvas(w, h);
+  c.getContext("2d").drawImage(img, 0, 0, w, h);
+  return c.toBuffer("image/png");
+}
+
+// 그리드 타일(Gundam 의 crop) — 읽기 순서로 OCR 후 이음새 중복 제거하며 합친다.
+async function ocrPageTiled(png, pageNum) {
+  const tiles = await splitPngForOcr(png);
+  if (tiles.length <= 1) return "";
+
+  const parts = [];
+  for (let i = 0; i < tiles.length; i++) {
+    try {
+      const text = await vllmOcrPageStrict(
+        tiles[i],
+        pageNum,
+        "image/png",
+        null,
+        prompts.pdfOcrTileUser(pageNum, i + 1, tiles.length)
+      );
+      if (text && !hasDegenerateRepeat(text)) parts.push(text);
+    } catch (e) {
+      console.warn(`[vllm-ocr] page ${pageNum} tile ${i + 1}/${tiles.length} failed:`, e?.message || e);
+    }
+  }
+  return cleanOcrText(stitchTiles(parts));
+}
+
+// 인접 타일은 overlap 밴드 텍스트를 양쪽에서 중복 인식한다 — 이음새에서 이전 타일 꼬리와 다음 타일
+// 머리의 '최대 공통 라인열'을 찾아 다음 타일에서 제거(중복 줄 제거). (export 는 단위 테스트용)
+export function stitchTiles(parts) {
+  const norm = (s) => String(s).replace(/\s+/g, " ").trim();
+  let out = [];
+  for (const part of parts) {
+    const lines = String(part).split("\n");
+    if (!out.length) { out = lines.slice(); continue; }
+    let bestK = 0;
+    const maxK = Math.min(15, out.length, lines.length);
+    for (let k = maxK; k >= 1; k--) {
+      let match = true;
+      for (let j = 0; j < k; j++) {
+        const a = norm(out[out.length - k + j]);
+        if (!a || a !== norm(lines[j])) { match = false; break; } // 빈 줄은 매칭 근거로 안 씀
+      }
+      if (match) { bestK = k; break; }
+    }
+    out = out.concat(lines.slice(bestK));
+  }
+  return out.join("\n");
+}
+
+async function splitPngForOcr(png) {
+  const img = await loadImage(png);
+  const W = img.width, H = img.height;
+  const maxTiles = Math.max(1, Math.floor(cfg.render.ocrMaxTiles || 6));
+  const minTiles = Math.min(maxTiles, Math.max(1, Math.floor(cfg.render.ocrMinTiles || 2)));
+  const [cols, rows] = chooseTileGrid(W, H, minTiles, maxTiles);
+  if (cols * rows <= 1) return [png];
+
+  const overlap = Math.max(0, Math.floor(cfg.render.ocrTileOverlapPx || 0));
+  const tiles = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const x0 = Math.max(0, Math.floor((col * W) / cols) - (col > 0 ? overlap : 0));
+      const y0 = Math.max(0, Math.floor((row * H) / rows) - (row > 0 ? overlap : 0));
+      const x1 = Math.min(W, Math.ceil(((col + 1) * W) / cols) + (col < cols - 1 ? overlap : 0));
+      const y1 = Math.min(H, Math.ceil(((row + 1) * H) / rows) + (row < rows - 1 ? overlap : 0));
+      const w = x1 - x0, h = y1 - y0;
+      const c = createCanvas(w, h);
+      c.getContext("2d").drawImage(img, x0, y0, w, h, 0, 0, w, h);
+      tiles.push(c.toBuffer("image/png"));
+    }
+  }
+  return tiles;
+}
+
+function chooseTileGrid(width, height, minTiles, maxTiles) {
+  const aspect = Math.max(0.01, width / Math.max(1, height));
+  let best = [1, 1];
+  let bestScore = Infinity;
+  for (let cols = 1; cols <= maxTiles; cols++) {
+    for (let rows = 1; rows <= maxTiles; rows++) {
+      const count = cols * rows;
+      if (count < minTiles || count > maxTiles) continue;
+      const gridAspect = cols / rows;
+      const score = Math.abs(Math.log(gridAspect / aspect)) + count * 0.015;
+      if (score < bestScore) {
+        best = [cols, rows];
+        bestScore = score;
+      }
+    }
+  }
+  return best;
 }
 
 // 스캔본(IMAGE_BASED_PDF) fallback: 전 페이지 lazy 렌더 → OCR → markdown 합성.
