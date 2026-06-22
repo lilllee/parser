@@ -11,7 +11,7 @@ import {
 } from "./vllm.js";
 import { resolveAiConfig, withAiConfig, aiEnabled, aiVisionEnabled } from "./ai.js";
 import { detectMangledPages } from "./detect.js";
-import { postprocessMarkdown, hasCrammedTable, looksLikeTocTable, hasSentenceStuffedTable, hasDuplicatedColumns } from "./postprocess.js";
+import { postprocessMarkdown, hasCrammedTable, looksLikeTocTable, hasSentenceStuffedTable, hasDuplicatedColumns, comparePageNumbers } from "./postprocess.js";
 import { collectInvisibleText, stripInvisibleFromBlocks } from "./invisible.js";
 import { detectBoundaryIssues } from "../tests/quality.mjs";
 
@@ -97,6 +97,100 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
     onProgress({ progress: 1 });
     console.log(`[convert] ${filename} 완료 · 이미지 OCR · md ${cleaned.length}자`);
     return { markdown: cleaned, metadata: { source: "image-ocr", mimeType: imageMime }, pageCount: 1 };
+  }
+
+  // ── 강제 전체페이지 vision OCR (kordoc 우회) ─────────────────────────────────
+  // kordoc 텍스트레이어 추출이 dense 한 한국어 표를 '열 뜯김 / 표→산문 / 숫자·문장부호 공백오염'으로
+  // 망치는 문서가 있다(정부문서 다수). reflow 게이트가 그 손상을 매번 잡지 못하므로(두더지잡기 한계),
+  // 이 모드는 게이트를 거치지 않고 모든 페이지를 렌더해 vision 으로 직접 전사한다(순수비전 전략 +
+  // 우리 postprocess·차트/그림 enrich). PDF 에만 적용 — 그 외 포맷은 ocrPdfBuffer 가 렌더 불가.
+  if (sink.forceOcr && isPdfName(filename)) {
+    if (!enabled) {
+      const err = new Error("강제 vision OCR 에는 AI provider 가 필요합니다 (provider / 설정 확인).");
+      err.code = "AI_REQUIRED";
+      throw err;
+    }
+    if (!vision) {
+      const err = new Error(
+        "강제 vision OCR 에는 vision provider 가 필요합니다 — claude-cli 텍스트 전용 모드 불가. " +
+          "vllm/bedrock/anthropic 사용 또는 CLAUDE_CLI_VISION=1."
+      );
+      err.code = "VISION_REQUIRED";
+      throw err;
+    }
+    onPhase({ phase: "ocr", message: "강제 전체페이지 vision OCR (kordoc 우회)" });
+    const kordocBuf = arrayBuffer.slice(0); // 숫자 대조 검증용 kordoc 사본(ocrPdfBuffer 가 원본을 소비)
+    const r = await ocrPdfBuffer(arrayBuffer, {
+      onPage: (i, total) => onPhase({ phase: "ocr", message: `OCR 페이지 ${i}/${total}` }),
+      onProgress: (p) => onProgress({ phase: "ocr", progress: p * 0.5 }),
+    });
+    let cleaned = postprocessMarkdown(r.markdown || "[OCR 결과 없음]");
+    let enrichStats = null;
+    if (enabled) {
+      onPhase({ phase: "enrich", message: "시각 자료 분석" });
+      const er = await enrichMarkdown(cleaned, [], {
+        onProgress: (p) => onProgress({ phase: "enrich", progress: 0.5 + p * 0.5 }),
+        onNote: (note) => onPhase({ phase: "enrich", message: note }),
+        visualPages: r.visualPages || [], // 전사 후 차트/그림 해설용 페이지 이미지
+        vision,
+      });
+      cleaned = er.markdown;
+      enrichStats = { enriched: er.enriched, skipped: er.skipped, failed: er.failed, total: er.total };
+    }
+    // 페이지별 숫자 검증: vision(구조 좋음)이 숫자를 오독했는지 kordoc 텍스트레이어(숫자 정확)와 대조.
+    // 안 깨지면 vision 그대로 채택, 깨진 페이지는 그 숫자를 경고로 표면화(출력은 유지 — 육안 확인용).
+    let verification = null;
+    try {
+      onPhase({ phase: "verify", message: "kordoc 숫자 대조 검증" });
+      const kr = await parse(kordocBuf, {});
+      // 페이지별 블록 → blocksToMarkdown 로 텍스트화. 표 셀 숫자까지 포함해야(표는 table 블록 구조라
+      // b.content 엔 없음) 예산표 등 숫자가 ground-truth 에 들어온다.
+      const kBlocksByPage = new Map();
+      for (const b of kr.blocks || []) {
+        if (!kBlocksByPage.has(b.pageNumber)) kBlocksByPage.set(b.pageNumber, []);
+        kBlocksByPage.get(b.pageNumber).push(b);
+      }
+      const kByPage = new Map();
+      for (const [pn, blks] of kBlocksByPage) kByPage.set(pn, blocksToMarkdown(blks));
+      verification = (r.pageTexts || []).map((vt, i) => ({
+        page: i + 1,
+        ...comparePageNumbers(kByPage.get(i + 1) || "", vt || ""),
+      }));
+      const mismatches = verification.filter((v) => !v.ok && !v.unverified);
+      for (const v of mismatches) {
+        onWarning({
+          code: "NUMERIC_MISMATCH",
+          message:
+            `p${v.page} 숫자 검증 — vision 이 kordoc 확인 숫자를 잃음/오독 의심: 누락 ${JSON.stringify(v.missing.slice(0, 10))}` +
+            (v.extra.length ? ` (참고: vision 에만 있는 숫자 ${JSON.stringify(v.extra.slice(0, 6))})` : "") +
+            ` — vision 출력 유지, 육안 확인 권장`,
+        });
+      }
+      const okN = verification.filter((v) => v.ok && !v.unverified).length;
+      const unv = verification.filter((v) => v.unverified).length;
+      console.log(
+        `[verify] ${filename} · 숫자대조 ok ${okN} / 불일치 ${mismatches.length} / 무근거(스캔) ${unv}`
+      );
+    } catch (e) {
+      console.warn("[verify] kordoc 대조 실패:", e?.message || e);
+    }
+    for (const w of detectBoundaryIssues(cleaned, filename).warnings) onWarning(w);
+    onProgress({ progress: 1 });
+    console.log(
+      `[convert] ${filename} 완료 · 강제 vision OCR · md ${cleaned.length}자 · ${r.ocrPages}/${r.pageCount}p` +
+        (enrichStats ? ` · enrich ${enrichStats.enriched}/${enrichStats.total}` : "")
+    );
+    return {
+      markdown: cleaned,
+      metadata: {
+        source: "force-ocr",
+        ocr: { pages: r.pageCount, recognized: r.ocrPages },
+        visualPagesFound: (r.visualPages || []).length,
+        enrich: enrichStats,
+        verification,
+      },
+      pageCount: r.pageCount,
+    };
   }
 
   // parse 단계: AI 활성화 시 0~0.5, 아니면 0~1
@@ -452,4 +546,8 @@ const IMAGE_MIME = {
 function imageMimeFromName(name) {
   const ext = String(name || "").split(".").pop().toLowerCase();
   return IMAGE_MIME[ext] || null;
+}
+
+function isPdfName(name) {
+  return String(name || "").toLowerCase().endsWith(".pdf");
 }

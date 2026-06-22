@@ -1,7 +1,7 @@
 // OpenAPI 스펙 (/api/openapi.json · Swagger UI /api/docs). ConvertRequest 의 vllm 기본값은 .env 값.
 
 const VLLM_URL_DEFAULT = process.env.VLLM_URL || "http://localhost:8000/v1/chat/completions";
-const VLLM_MODEL_DEFAULT = process.env.VLLM_MODEL || "qwen/qwen3.6-27b";
+const VLLM_MODEL_DEFAULT = process.env.VLLM_MODEL || "Intel/Qwen3.5-122B-A10B-int4-AutoRound";
 const MINERU_URL_DEFAULT = process.env.MINERU_URL || "http://localhost:8000";
 const VLLM_THINKING_DEFAULT = process.env.VLLM_THINKING === "1";
 const BEDROCK_REGION_DEFAULT = process.env.BEDROCK_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
@@ -192,6 +192,11 @@ export const openapiSpec = {
             default: "md",
             description: "출력 표 포맷. md(기본): 사람/RAG 가독용 markdown 파이프 표. html: <table> 구조 보존(병합셀·ParseBench GRITS 등 HTML 표만 인식하는 소비처용).",
           },
+          force_ocr: {
+            type: "boolean",
+            default: /^(1|true|on|yes)$/i.test(process.env.FORCE_OCR || ""),
+            description: "PDF 를 kordoc 우회하고 전체페이지 vision OCR 로 전사(+postprocess·차트 enrich·페이지별 숫자검증). 미지정 시 서버 기본값(FORCE_OCR env)을 따르고, 지정하면 그 값이 우선(false 로 끄기도 가능). ⚠ 적용 대상: PDF 만 — HWP/HWPX/DOCX 는 자동 제외돼 kordoc 전처리를 거치고, 이미지는 원래부터 vision 이다. 숫자검증은 kordoc 텍스트레이어 숫자와 대조해 vision 오독 의심 페이지를 metadata.verification·NUMERIC_MISMATCH 경고로 표면화(출력은 vision 유지). 컨텍스트 초과 페이지는 1024 단일뷰→그리드타일(DeepSeek) 폴백. vision provider(vllm/bedrock/anthropic) 필요, mineru 엔 무효. (mode=vision 으로도 켜짐)",
+          },
           api_key: {
             type: "string",
             description: "[openai / anthropic / gemini] API 키.",
@@ -240,6 +245,12 @@ export const openapiSpec = {
             type: "integer",
             nullable: true,
             description: "PDF 페이지 수 / HWP·HWPX 섹션 수 / XLSX 시트 수",
+          },
+          verification: {
+            type: "array",
+            nullable: true,
+            description: "force_ocr 시에만. 페이지별 숫자 대조 결과 — { page, kordocNumbers, missing[], extra[], ok, unverified }. ok=false 면 vision 숫자가 kordoc 과 어긋남(육안 확인), unverified=true 면 kordoc 텍스트 없음(스캔, 무근거).",
+            items: { type: "object", additionalProperties: true },
           },
           elapsedMs: {
             type: "integer",

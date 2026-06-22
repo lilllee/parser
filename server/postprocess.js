@@ -478,6 +478,43 @@ export function hasDuplicatedColumns(md) {
   return false;
 }
 
+// 페이지별 숫자 대조 검증 — vision 전사(구조는 좋으나 숫자 오독 리스크)가 숫자를 틀리게 읽었는지
+// kordoc 텍스트레이어 숫자와 대조한다. kordoc 은 dense 표 '구조'는 깨도 텍스트레이어 '숫자'는 정확
+// 하므로 ground-truth 로 쓴다. '의미있는 데이터 숫자'(소수점/콤마 포함 또는 3자리+)만 비교해
+// 페이지번호·리스트마커 같은 1~2자리 노이즈를 배제. kordoc 텍스트가 비면(스캔 페이지) 검증 근거가
+// 없으므로 unverified(=ok 로 두되 무근거 표시). (export — 단위 테스트 + force_ocr 검증에서 사용)
+export function comparePageNumbers(kordocText, visionText) {
+  const significant = (s) => s.includes(".") || /,/.test(s) || s.replace(/^0+/, "").length >= 3;
+  const nums = (t) =>
+    [...String(t || "").matchAll(/\d[\d,]*(?:\.\d+)?/g)]
+      .map((m) => m[0].replace(/,/g, ""))
+      .filter(significant);
+  const toSet = (arr) => {
+    const m = new Map();
+    for (const x of arr) m.set(x, (m.get(x) || 0) + 1);
+    return m;
+  };
+  const kset = toSet(nums(kordocText));
+  const vset = toSet(nums(visionText));
+  const kcount = [...kset.values()].reduce((a, b) => a + b, 0);
+  if (kcount === 0) return { kordocNumbers: 0, missing: [], extra: [], ok: true, unverified: true };
+  const missing = []; // kordoc 에 있는데 vision 에 부족 = vision 누락/오독
+  for (const [num, c] of kset) {
+    const have = vset.get(num) || 0;
+    for (let i = have; i < c; i++) missing.push(num);
+  }
+  const extra = []; // vision 에 있는데 kordoc 에 없음 = vision 이 더 완전(kordoc 미추출 영역)이거나 연도 등
+  for (const [num, c] of vset) {
+    const have = kset.get(num) || 0;
+    for (let i = have; i < c; i++) extra.push(num);
+  }
+  // ok 판정은 missing 기준으로만 한다 — 진짜 정확도 손실은 'kordoc 이 확인한 숫자를 vision 이 잃거나
+  // 오독한 것'(missing)이다. extra(vision 이 더 많음)는 kordoc 이 그 영역을 못 읽은 경우가 대부분이라
+  // 오류로 보지 않는다(정보로만 보고). 오독(예 2,306→2,308)은 missing[2306]+extra[2308] 로 나오므로
+  // missing 기준만으로도 그대로 잡힌다.
+  return { kordocNumbers: kcount, missing, extra, ok: missing.length === 0, unverified: false };
+}
+
 // 목차가 표(파이프/HTML)로 잘못 떠진 경우 감지: 데이터 행의 절반 이상이 'N-N(또는 제N장) … 페이지번호'
 // 패턴이면 TOC 표로 본다. 제목이 컬럼에 쪼개진 파이프 목차(크램드 HTML 이 아닌)도 잡아 vision 라우팅.
 // 진짜 데이터 표는 '섹션라벨 … 단독 페이지번호' 행이 드물어 안 걸린다. (export)
