@@ -7,7 +7,9 @@ export const vllmConfig = Object.freeze({
       image: 512,
       table: 256,
       pageVisual: 640,
-      ocr: 2000,
+      // 전면 통계표·명단 같은 빽빽한 페이지는 2000 으로 잘려(truncation) 재시도에 의존했다(보육 실측).
+      // 정확도/완전성 우선이라 4096 으로 올려 한 번에 담는다(잘림 시 ai.js 가 8192 까지 추가 확대).
+      ocr: Number(process.env.VLLM_OCR_MAX_TOKENS || 4096),
     },
     concurrency: {
       enrich: Number(process.env.VLLM_CONCURRENCY || 3),

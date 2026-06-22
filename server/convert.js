@@ -182,7 +182,13 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
     );
     return {
       markdown: cleaned,
-      metadata: { source: "force-ocr", ocr: { pages: r.pageCount, recognized: r.ocrPages }, verification },
+      metadata: {
+        source: "force-ocr",
+        ocr: { pages: r.pageCount, recognized: r.ocrPages },
+        visualPagesFound: (r.visualPages || []).length,
+        enrich: enrichStats,
+        verification,
+      },
       pageCount: r.pageCount,
     };
   }

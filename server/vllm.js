@@ -561,7 +561,38 @@ function findVisualPageTargets(md, visualPages, occupied) {
     seenPages.add(page.page);
   }
 
+  // 폴백: 차트 단서로 수집됐으나 위 캡션 매칭에 실패한 시각 페이지도, 그 페이지 본문("## 페이지 N"
+  // 섹션 끝) 위치에 앵커링해 설명 대상에 포함한다. 캡션 미전사/텍스트 불일치로 차트 설명이 통째
+  // 누락되던 문제 보완(force_ocr·스캔 OCR 공통). analyzeTarget 가 NO_VISUAL 이면 폐기되므로 비차트
+  // 페이지는 무해. context 로 그 페이지 OCR 텍스트를 줘 grounding(환각 방지).
+  for (const page of visualPages) {
+    if (!page?.image || seenPages.has(page.page)) continue;
+    if (page.image.length > cfg.limits.pageVisualImageKb * 1024) { seenPages.add(page.page); continue; }
+    const anchor = anchorIndexForPage(md, page.page);
+    if (anchor == null) continue;
+    targets.push({
+      type: "page-visual",
+      index: anchor,
+      length: 0,
+      page: page.page,
+      imageUrl: page.image,
+      context: (page.blocks?.[0]?.content || "").slice(0, 800),
+    });
+    seenPages.add(page.page);
+  }
+
   return targets;
+}
+
+// "## 페이지 N" 섹션 끝 위치(다음 페이지 마커/구분선/문서끝) — page-visual 폴백 앵커.
+// ocrPdfBuffer 가 다중 페이지를 "## 페이지 N" 헤딩으로 합치므로 그 규약에 기댄다(단일 페이지면 null).
+function anchorIndexForPage(md, pageNum) {
+  const marker = `## 페이지 ${pageNum}`;
+  const start = md.indexOf(marker);
+  if (start < 0) return null;
+  const from = start + marker.length;
+  const cands = [md.indexOf("\n## 페이지 ", from), md.indexOf("\n---", from)].filter((n) => n >= 0);
+  return cands.length ? Math.min(...cands) : md.length;
 }
 
 function findPageForContext(line, visualPages) {

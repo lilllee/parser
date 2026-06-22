@@ -55,7 +55,9 @@ export function scoreMarkdown(md) {
 
   // 7) 차트 설명 커버리지: [그림 N] 캡션 중 직후 N줄 안에 "> 설명" 붙은 비율
   const figIdx = [];
-  lines.forEach((l, i) => { if (/\[그림\s*\d+|\[그림\d|Figure\s*\d+/i.test(l)) figIdx.push(i); });
+  // 인용("> ") 줄은 enrich 가 붙인 '설명'이라 [그림 N]을 되풀이한다 — 캡션으로 세면 분모가
+  // 부풀고 커버리지가 왜곡되므로 제외하고, 진짜 캡션 줄만 그림으로 센다.
+  lines.forEach((l, i) => { if (!/^\s*>/.test(l) && /\[그림\s*\d+|\[그림\d|Figure\s*\d+/i.test(l)) figIdx.push(i); });
   let described = 0;
   for (const i of figIdx) {
     for (let j = i + 1; j <= i + 4 && j < lines.length; j++) {
