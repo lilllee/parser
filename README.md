@@ -69,7 +69,15 @@ AI 백엔드는 요청마다 `provider` 로 고른다(미지정 시 `vllm`). 설
 - `BEDROCK_REGION` · `BEDROCK_MODEL` · `BEDROCK_PROFILE` — AWS Bedrock Converse
 - `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` — 외부 provider 키
 
-전체 옵션은 `.env` 인라인 주석을, 변환 파이프라인 내부 동작은 [`pipeline.md`](./pipeline.md) 를 참고한다.
+OCR 품질 토글(reflow 경로, 모두 기본 on — `=0` 이면 legacy 동작으로 복귀):
+
+- `VLLM_OCR_ANCHOR` — kordoc 텍스트레이어를 vision OCR 보조 anchor 로 주입(숫자 오독↓). `VLLM_OCR_ANCHOR_MAX_CHARS`(기본 2000)로 길이 제한
+- `VLLM_OCR_NUMERIC_REPAIR` — 전사 후 kordoc 숫자와 대조해 누락/오독을 보정 재시도(accept/rollback). `..._MAX`(기본 1) · `..._MIN_MISMATCH`(기본 2)
+- `VLLM_OCR_PAGE_INFO` — OCR 프롬프트에 '페이지 N / 총 M' 주입
+- `VLLM_PAGE_VISUAL_REFLOW` — 텍스트 PDF 경로의 차트/그림 페이지도 해설 enrich
+
+전체 옵션은 `.env` 인라인 주석을, 변환 파이프라인 내부 동작·튜닝 근거는 [`pipeline.md`](./pipeline.md) 와
+[`docs/ocr-anchor-improvement-plan.md`](./docs/ocr-anchor-improvement-plan.md) 를 참고한다.
 
 ## 구조
 

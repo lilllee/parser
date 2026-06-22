@@ -6,6 +6,7 @@ import {
   ocrImageBuffer,
   ocrPdfBuffer,
   ocrSelectedPdfPages,
+  collectChartVisualPages,
   hasBrokenTable,
   toSafeImageUrl,
 } from "./vllm.js";
@@ -153,11 +154,21 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
     let verification = null;
     try {
       onPhase({ phase: "verify", message: "kordoc 숫자 대조 검증" });
+      const invisBuf = kordocBuf.slice(0); // parse 가 detach 하기 전에 invisible 판정용 사본 확보
       const kr = await parse(kordocBuf, {});
+      // 검증 기준 kordoc 블록에서 보이지 않는 텍스트(흰글자 등 숨은 숫자)를 제거 — 안 그러면 화면엔
+      // 없는 숨은 숫자가 'kordoc 확인 숫자'로 잡혀 vision 이 정상인데도 거짓 NUMERIC_MISMATCH 가 난다.
+      let kBlocks = kr.blocks || [];
+      try {
+        const invis = collectInvisibleText(invisBuf);
+        if (invis.size) kBlocks = stripInvisibleFromBlocks(kBlocks, invis).blocks;
+      } catch (e) {
+        console.warn("[verify] invisible strip 실패:", e?.message || e);
+      }
       // 페이지별 블록 → blocksToMarkdown 로 텍스트화. 표 셀 숫자까지 포함해야(표는 table 블록 구조라
       // b.content 엔 없음) 예산표 등 숫자가 ground-truth 에 들어온다.
       const kBlocksByPage = new Map();
-      for (const b of kr.blocks || []) {
+      for (const b of kBlocks) {
         if (!kBlocksByPage.has(b.pageNumber)) kBlocksByPage.set(b.pageNumber, []);
         kBlocksByPage.get(b.pageNumber).push(b);
       }
@@ -411,10 +422,26 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
           expectedTables.set(b.pageNumber, (expectedTables.get(b.pageNumber) || 0) + 1);
         }
       }
+      // 그 페이지 kordoc 텍스트(숫자·철자 정확)를 vision OCR 보조로 사용 — P0 anchor 주입 + P0.5 숫자
+      // 보정 검증의 공용 입력(단일 Map, drift 방지). anchor·repair 중 하나라도 켜지면 빌드한다.
+      // - 펼침면(좌우 반쪽 OCR)은 영역 불일치 → 제외.
+      // - 한글 무공백 뭉침(NOSPACE_RUN) 결함 페이지는 베끼면 한글 붕괴 → 제외(D2). (그 페이지는 repair 도 생략)
+      // - 둘 다 =0 이면 빈 Map → anchor·repair 미적용(legacy byte-identical).
+      const kordocByPage = new Map();
+      if (process.env.VLLM_OCR_ANCHOR !== "0" || process.env.VLLM_OCR_NUMERIC_REPAIR !== "0") {
+        for (const pn of targets) {
+          if (spreadForOcr.has(pn)) continue;
+          const a = blocksToMarkdown(blocksByPage.get(pn) || []);
+          if (!a || a.trim().length < 20 || NOSPACE_RUN.test(a)) continue;
+          kordocByPage.set(pn, a);
+        }
+      }
       try {
         const texts = await ocrSelectedPdfPages(rawBackup.slice(0), targets, {
           spreadPages: spreadForOcr,
           expectedTables,
+          kordocByPage,
+          onWarning,
           onPage: (i, total, pn) =>
             onPhase({ phase: "ocr", message: `vision 재추출 ${i}/${total} (p${pn})` }),
         });
@@ -444,6 +471,30 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
         }
       } catch (e) {
         console.warn("[reflow] failed:", e?.message || e);
+      }
+    }
+
+    // P1.5(D4=B): 차트/그림 단서가 있는 '전' 페이지를 렌더해 enrich page-visual 입력으로 모은다.
+    // (force_ocr/스캔은 ocrPdfBuffer 가 전사 중 모으지만, kordoc 경로는 reflow 대상이 아닌 차트 페이지를
+    // 놓치므로 여기서 별도 렌더. 비차트 페이지는 enrich 가 NO_VISUAL 로 폐기 → 무해.) 펼침면 제외.
+    if (
+      process.env.VLLM_PAGE_VISUAL !== "0" &&
+      process.env.VLLM_PAGE_VISUAL_REFLOW !== "0" &&
+      !visualPages.length
+    ) {
+      const byPg = new Map();
+      for (const b of result.blocks || []) {
+        if (!byPg.has(b.pageNumber)) byPg.set(b.pageNumber, []);
+        byPg.get(b.pageNumber).push(b);
+      }
+      const textByPage = new Map();
+      for (const [pn, blks] of byPg) textByPage.set(pn, blocksToMarkdown(blks));
+      try {
+        visualPages = await collectChartVisualPages(rawBackup.slice(0), textByPage, { exclude: spreadPages });
+        if (visualPages.length)
+          console.log(`[page-visual] ${filename} · kordoc 경로 차트 단서 ${visualPages.length}p 수집`);
+      } catch (e) {
+        console.warn("[page-visual] collect 실패:", e?.message || e);
       }
     }
   }
@@ -484,7 +535,14 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
 
   return {
     markdown: cleaned,
-    metadata: result.metadata || {},
+    // 결정/관측 로그를 응답 metadata 에 노출(최종 markdown 엔 절대 넣지 않음 — RAG 오염 방지).
+    // reflowInfo 는 이전엔 계산·로그만 되고 반환에서 누락됐다(P2-B 수정).
+    metadata: {
+      ...(result.metadata || {}),
+      ...(ocrInfo ? { ocr: ocrInfo } : {}),
+      ...(reflowInfo ? { reflow: reflowInfo } : {}),
+      ...(enrichStats ? { enrich: enrichStats } : {}),
+    },
     // PDF 는 result.pageCount, HWP/XLSX 등은 metadata.pageCount 에 들어가므로 fallback.
     pageCount: result.pageCount ?? result.metadata?.pageCount ?? null,
   };

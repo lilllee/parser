@@ -3,6 +3,7 @@ import { createCanvas, loadImage } from "@napi-rs/canvas";
 import { aiComplete, aiCheck, aiInfo, AI_ENABLED, formatAiError } from "./ai.js";
 import { vllmConfig as cfg } from "./config/vllm.js";
 import { vllmPrompts as prompts } from "./config/prompt.js";
+import { comparePageNumbers } from "./postprocess.js";
 
 export const VLLM_ENABLED = AI_ENABLED;
 export const vllmInfo = aiInfo;
@@ -315,6 +316,32 @@ const OCR_SAMPLING = Object.freeze({
   frequencyPenalty: Number(process.env.VLLM_OCR_FREQUENCY_PENALTY ?? 0),
 });
 
+// anchor(텍스트레이어 보조)를 user 블록에 넣기 전 길이 제한. cap 이내면 통짜, 초과하면 tiered 압축:
+// 표 구분행/<table> 주변 줄 + 헤더(#)/유의숫자(소수점·콤마·3자리+) 라인을 우선 보존하고, 그래도
+// 넘치면 머리+꼬리만 남기고 중략. 통짜 주입 시 모델이 anchor 를 베끼는 리스크를 줄이려 보수적 cap.
+// (export 는 단위 테스트용)
+export function truncateAnchor(text, cap = cfg.limits.ocrAnchorMaxChars) {
+  const t = String(text || "").trim();
+  if (!t || t.length <= cap) return t;
+  const lines = t.split("\n");
+  const keep = [];
+  let used = 0;
+  const priority = (l) =>
+    /<table[\s>]|^\s*\|?\s*:?-{2,}:?\s*\|/.test(l) ||           // 표 구분행 / HTML 표
+    /^\s*#{1,6}\s/.test(l) ||                                    // 헤더
+    /\d[\d,]*\.\d|\d{1,3}(?:,\d{3})+|\d{3,}/.test(l);            // 유의숫자(소수점·콤마·3자리+)
+  for (const l of lines) {
+    if (!priority(l)) continue;
+    if (used + l.length + 1 > cap) break;
+    keep.push(l);
+    used += l.length + 1;
+  }
+  if (keep.length) return keep.join("\n") + "\n…(중략)…";
+  // 우선 라인이 없으면(산문 위주) 머리 절반 + 꼬리 절반.
+  const half = Math.floor(cap / 2);
+  return t.slice(0, half) + "\n…(중략)…\n" + t.slice(-half);
+}
+
 // 복잡한 표(병합·중첩)에서 모델이 markdown 으로 표를 깨뜨리는 출력 신호. 결정적으로 감지해
 // 재시도한다 — 모델이 같은 페이지를 절반쯤은 올바른 HTML 로 그리므로 몇 번 재시도하면 수렴.
 const TABLE_MAX_RETRY = Number(process.env.VLLM_OCR_TABLE_RETRY ?? 2);
@@ -468,13 +495,20 @@ function htmlTableRowWidths(table) {
 
 // 페이지 OCR 본체 — 실패 시 throw (호출부에서 스케일 재시도 등 판단).
 // 공통 지시문은 system 으로(byte 동일 → prefix cache), 페이지 번호 등 가변값은 user 로.
-async function vllmOcrPageStrict(pageImage, pageNumber, mimeType = "image/png", samplingOverride = null, extraInstruction = "") {
+async function vllmOcrPageStrict(
+  pageImage,
+  pageNumber,
+  mimeType = "image/png",
+  { samplingOverride = null, extraInstruction = "", anchorText = "", pageTotal = null } = {}
+) {
   const b64 = Buffer.from(pageImage).toString("base64");
   const url = `data:${mimeType};base64,${b64}`;
   const text = await aiCall({
     image: url,
     system: prompts.pdfOcrSystem,
-    prompt: prompts.pdfOcrUser(pageNumber) + (extraInstruction ? `\n${extraInstruction}` : ""),
+    prompt: prompts.pdfOcrUser(pageNumber, pageTotal) + (extraInstruction ? `\n${extraInstruction}` : ""),
+    // anchor 는 별도 user text 블록으로(system 불변 → prefix cache). 비면 미전달 = legacy byte-identical.
+    text: anchorText ? prompts.pdfOcrAnchor(truncateAnchor(anchorText)) : undefined,
     maxTokens: cfg.tokens.ocr,
     ...OCR_SAMPLING,
     ...(samplingOverride || {}),
@@ -608,7 +642,7 @@ function findVisualPageTargets(md, visualPages, occupied) {
   for (const page of visualPages) {
     if (!page?.image || seenPages.has(page.page)) continue;
     if (page.image.length > cfg.limits.pageVisualImageKb * 1024) { seenPages.add(page.page); continue; }
-    const anchor = anchorIndexForPage(md, page.page);
+    const anchor = anchorIndexForPage(md, page.page, page.blocks?.[0]?.content || "");
     if (anchor == null) continue;
     targets.push({
       type: "page-visual",
@@ -624,15 +658,29 @@ function findVisualPageTargets(md, visualPages, occupied) {
   return targets;
 }
 
-// "## 페이지 N" 섹션 끝 위치(다음 페이지 마커/구분선/문서끝) — page-visual 폴백 앵커.
-// ocrPdfBuffer 가 다중 페이지를 "## 페이지 N" 헤딩으로 합치므로 그 규약에 기댄다(단일 페이지면 null).
-function anchorIndexForPage(md, pageNum) {
+// page-visual 폴백 앵커 위치 산출.
+// 1) 스캔/force_ocr 합본: ocrPdfBuffer 가 "## 페이지 N" 헤딩으로 합치므로 그 섹션 끝을 쓴다.
+// 2) kordoc/reflow md: "## 페이지 N" 이 없다(P1.5 함정) → 그 페이지 텍스트의 distinctive 라인을
+//    본문에서 찾아 그 줄 끝을 앵커로 한다(차트 해설을 해당 페이지 근처에 삽입). 매칭 실패면 null(미삽입).
+// (export 는 단위 테스트용)
+export function anchorIndexForPage(md, pageNum, pageText = "") {
   const marker = `## 페이지 ${pageNum}`;
   const start = md.indexOf(marker);
-  if (start < 0) return null;
-  const from = start + marker.length;
-  const cands = [md.indexOf("\n## 페이지 ", from), md.indexOf("\n---", from)].filter((n) => n >= 0);
-  return cands.length ? Math.min(...cands) : md.length;
+  if (start >= 0) {
+    const from = start + marker.length;
+    const cands = [md.indexOf("\n## 페이지 ", from), md.indexOf("\n---", from)].filter((n) => n >= 0);
+    return cands.length ? Math.min(...cands) : md.length;
+  }
+  // 텍스트 기반 폴백: 페이지 본문의 뒤쪽 라인부터 본문에서 찾아 그 줄 끝에 앵커(페이지 끝 근처).
+  const lines = String(pageText)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length >= 12);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const idx = md.indexOf(lines[i]);
+    if (idx >= 0) return idx + lines[i].length;
+  }
+  return null;
 }
 
 function findPageForContext(line, visualPages) {
@@ -743,17 +791,19 @@ function countTables(text) {
 // 렌더 → OCR 1页. 컨텍스트 초과(400)면 0.7배로 줄여 1회 재시도. 그 외 실패는 "" (페이지 단위 격리).
 // expectedTables: kordoc 가 그 페이지에서 본 '실제 표' 개수 — vision 출력이 이보다 적으면(표 누락/
 // 본문에 흡수) 깨진 것으로 보고 재시도한다(사용자 사례: '26년 예산 표가 통째로 누락된 케이스).
-async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0) {
+async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0, anchorText = "") {
   let png = null;
   let fullPng = null;
   let text = null;
+  // '페이지 N / 총 M' 의 M 은 문서 전체 페이지 수 — renderer 가 보유(별도 전파 불필요). 끄면 null.
+  const pageTotal = cfg.features.pageInfo ? renderer.pageCount : null;
   // 검증/디버그용: 컨텍스트 초과를 기다리지 않고 강제로 fallback 경로를 탄다.
   // VLLM_OCR_FORCE_TILE=global → 1024 단일뷰만, =tile → 그리드 타일만, 그 외 truthy → global→tile.
   const force = process.env.VLLM_OCR_FORCE_TILE;
   if (force) {
     const fp = renderer.renderPage(pageNum, 1);
     if (force === "tile") return ocrPageTiled(fp, pageNum);
-    const g = await ocrPageGlobalView(fp, pageNum);
+    const g = await ocrPageGlobalView(fp, pageNum, anchorText, pageTotal);
     return g || ocrPageTiled(fp, pageNum);
   }
   // 1) 렌더 → OCR. 컨텍스트 초과(400)면 0.7배로 줄여 재시도하고, 그래도 넘치면
@@ -767,7 +817,7 @@ async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0) {
       return "";
     }
     try {
-      text = await vllmOcrPageStrict(png, pageNum, "image/png");
+      text = await vllmOcrPageStrict(png, pageNum, "image/png", { anchorText, pageTotal });
       break;
     } catch (e) {
       if (factor === 1 && isContextOverflow(e)) {
@@ -777,7 +827,7 @@ async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0) {
       if (isContextOverflow(e) && cfg.render.ocrTileFallback) {
         // DeepSeek 'Base'(1024) 단일뷰 먼저 — 스티칭/이음새 중복 없는 깨끗한 한 패스로 대부분 해결.
         console.warn(`[vllm-ocr] page ${pageNum} 축소 후에도 컨텍스트 초과 — global 뷰(1024) 단일패스 시도`);
-        const g = await ocrPageGlobalView(fullPng || png, pageNum);
+        const g = await ocrPageGlobalView(fullPng || png, pageNum, anchorText, pageTotal);
         if (g) return g;
         console.warn(`[vllm-ocr] page ${pageNum} global 뷰 실패/부족 — 그리드 타일(Gundam) OCR`);
         return ocrPageTiled(fullPng || png, pageNum);
@@ -797,13 +847,12 @@ async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0) {
         : `표 누락(${countTables(text)}/${expectedTables})`;
     console.warn(`[vllm-ocr] page ${pageNum} ${why} 감지 — 재시도 ${r + 1}/${TABLE_MAX_RETRY}`);
     try {
-      const retry = await vllmOcrPageStrict(
-        png,
-        pageNum,
-        "image/png",
-        { temperature: 0.4, repetitionPenalty: Math.max(1.05, OCR_SAMPLING.repetitionPenalty || 1.0) },
-        hasDegenerateRepeat(text) ? prompts.pdfOcrRepeatRetry : prompts.pdfOcrTableRetry
-      );
+      const retry = await vllmOcrPageStrict(png, pageNum, "image/png", {
+        samplingOverride: { temperature: 0.4, repetitionPenalty: Math.max(1.05, OCR_SAMPLING.repetitionPenalty || 1.0) },
+        extraInstruction: hasDegenerateRepeat(text) ? prompts.pdfOcrRepeatRetry : prompts.pdfOcrTableRetry,
+        anchorText,
+        pageTotal,
+      });
       if (retry && !bad(retry)) return retry;
       if (retry && countTables(retry) > countTables(text)) text = retry; // 더 완전한 쪽 유지
     } catch (e) {
@@ -817,10 +866,10 @@ async function ocrPageAdaptive(renderer, pageNum, expectedTables = 0) {
 // DeepSeek 'Base'(1024) 모드: 전체 페이지를 1024 긴변 단일 뷰로 다운스케일해 한 번에 OCR.
 // 그리드 타일과 달리 스티칭/이음새 중복이 없는 깨끗한 단일 패스라, '큰' 페이지의 컨텍스트 초과는
 // 대부분 이걸로 해결된다. 1024 에서도 작은 글자가 뭉개지거나 여전히 초과(또는 반복 붕괴)면 null → 타일로.
-async function ocrPageGlobalView(png, pageNum) {
+async function ocrPageGlobalView(png, pageNum, anchorText = "", pageTotal = null) {
   try {
     const small = await downscalePngLongSide(png, cfg.render.ocrBaseViewPx || 1024);
-    const t = await vllmOcrPageStrict(small, pageNum, "image/png");
+    const t = await vllmOcrPageStrict(small, pageNum, "image/png", { anchorText, pageTotal });
     return t && !hasDegenerateRepeat(t) ? t : null;
   } catch (e) {
     console.warn(`[vllm-ocr] page ${pageNum} global 뷰 실패:`, e?.message || e);
@@ -849,13 +898,11 @@ async function ocrPageTiled(png, pageNum) {
   const parts = [];
   for (let i = 0; i < tiles.length; i++) {
     try {
-      const text = await vllmOcrPageStrict(
-        tiles[i],
-        pageNum,
-        "image/png",
-        null,
-        prompts.pdfOcrTileUser(pageNum, i + 1, tiles.length)
-      );
+      // 타일은 페이지 일부만 보므로 페이지 전체 anchor·'페이지 N/M' 부적합(영역 불일치) — 미전달.
+      // 페이지 표시는 타일 프롬프트(pdfOcrTileUser)가 '페이지 N 의 X/Y 타일' 로 담당.
+      const text = await vllmOcrPageStrict(tiles[i], pageNum, "image/png", {
+        extraInstruction: prompts.pdfOcrTileUser(pageNum, i + 1, tiles.length),
+      });
       if (text && !hasDegenerateRepeat(text)) parts.push(text);
     } catch (e) {
       console.warn(`[vllm-ocr] page ${pageNum} tile ${i + 1}/${tiles.length} failed:`, e?.message || e);
@@ -977,6 +1024,42 @@ export async function ocrPdfBuffer(arrayBuffer, { onProgress, onPage, collectVis
   return { markdown: sections.join("\n\n---\n\n"), pageCount, ocrPages: okCount, visualPages, pageTexts: texts };
 }
 
+// P1.5(D4=B): kordoc(텍스트 PDF) 경로용 — 차트/그림 단서가 있는 페이지를 렌더해 page-visual enrich
+// 입력으로 모은다. force_ocr/스캔은 ocrPdfBuffer 가 전사 중 모으지만, reflow 대상이 아닌 차트 페이지는
+// 놓치므로 '전 페이지'를 cue 로 훑는다. pageTextByPage: Map<page, markdown>(kordoc 페이지 텍스트 —
+// cue 판정 + enrich 캡션/앵커 매칭 grounding 용). exclude: 제외 페이지 Set(펼침면 등).
+export async function collectChartVisualPages(arrayBuffer, pageTextByPage, { exclude } = {}) {
+  if (!cfg.features.pageVisual || !(pageTextByPage instanceof Map) || !pageTextByPage.size) return [];
+  const skip = exclude instanceof Set ? exclude : new Set(exclude || []);
+  let renderer;
+  try {
+    renderer = await openPdfRenderer(arrayBuffer);
+  } catch (e) {
+    console.warn("[page-visual] open 실패:", e?.message || e);
+    return [];
+  }
+  const visualPages = [];
+  for (const [page, text] of [...pageTextByPage].sort((a, b) => a[0] - b[0])) {
+    if (visualPages.length >= VISUAL_PAGE_CAP) break;
+    if (skip.has(page) || !text || !VISUAL_CUE_RE.test(text)) continue;
+    try {
+      const png = renderer.renderPage(page, VISUAL_RENDER_FACTOR);
+      if (png.length > cfg.limits.pageVisualImageKb * 1024) {
+        console.warn(`[page-visual] skip p${page}: ${Math.round(png.length / 1024)}KB > ${cfg.limits.pageVisualImageKb}KB`);
+        continue;
+      }
+      visualPages.push({
+        page,
+        image: `data:image/png;base64,${png.toString("base64")}`,
+        blocks: [{ content: text }],
+      });
+    } catch (e) {
+      console.warn(`[page-visual] render p${page} 실패:`, e?.message || e);
+    }
+  }
+  return visualPages;
+}
+
 // 2-page spread(펼침면): landscape 페이지 폭이 세로 페이지 폭의 ~2배면 펼침면으로 판정한다.
 // 텍스트 신호로는 안 잡혀 페이지 기하로 감지. VLLM_SPREAD_SPLIT=0 으로 끔.
 
@@ -1070,20 +1153,83 @@ async function splitPngHalves(png) {
   return [crop(0, halfW), crop(halfW, W - halfW)];
 }
 
-export async function ocrSelectedPdfPages(arrayBuffer, pageNumbers, { onPage, spreadPages, expectedTables } = {}) {
+// 보정본 채택 판정(순수) — missing 이 엄격히 줄고, 새로 생긴 extra(환각 의심)가 missing 감소폭을
+// 넘지 않을 때만 채택. 환각으로 missing 만 메우고 사실오류(extra)를 늘리는 것을 막는 보수적 규칙.
+// (export 는 단위 테스트용)
+export function acceptNumericRepair(prevMiss, prevExtra, cmp) {
+  const missDrop = prevMiss - cmp.missing.length;
+  const extraRise = cmp.extra.length - prevExtra;
+  return missDrop > 0 && extraRise <= missDrop;
+}
+
+// P0.5: reflow 페이지 vision 전사를 kordoc 숫자와 대조해 누락/오독이 임계 이상이면 보정 재호출.
+// accept 는 acceptNumericRepair(보수적) + 표/반복 비파괴일 때만, 아니면 rollback(원본 유지).
+// 보정 실패 시 남은 불일치는 onWarning 으로 표면화(육안 확인). 펼침면 제외.
+async function numericRepairPage(renderer, page, visionText, kordocText, pageTotal, onWarning) {
+  const base = comparePageNumbers(kordocText, visionText);
+  if (base.unverified || base.missing.length < cfg.limits.numericRepairMinMismatch) return visionText;
+  let png;
+  try { png = renderer.renderPage(page); } catch { return visionText; }
+  let best = visionText, bestMiss = base.missing.length, bestExtra = base.extra.length, missing = base.missing;
+  for (let r = 0; r < cfg.limits.numericRepairMax; r++) {
+    console.warn(`[vllm-ocr] page ${page} 숫자 불일치 ${bestMiss}건 — 보정 재시도 ${r + 1}/${cfg.limits.numericRepairMax}`);
+    let retry;
+    try {
+      retry = await vllmOcrPageStrict(png, page, "image/png", {
+        samplingOverride: { temperature: 0 },
+        extraInstruction: prompts.pdfOcrNumericRepair(missing),
+        pageTotal,
+      });
+    } catch (e) {
+      console.warn(`[vllm-ocr] page ${page} 숫자 보정 호출 실패:`, e?.message || e);
+      break;
+    }
+    if (!retry || hasBrokenTable(retry) || hasDegenerateRepeat(retry)) break; // 표/반복 파괴면 폐기(rollback)
+    const cmp = comparePageNumbers(kordocText, retry);
+    if (acceptNumericRepair(bestMiss, bestExtra, cmp)) {
+      best = retry; bestMiss = cmp.missing.length; bestExtra = cmp.extra.length; missing = cmp.missing;
+      if (bestMiss === 0) break;
+    } else {
+      break; // 개선 없음/악화 → rollback
+    }
+  }
+  if (best !== visionText) {
+    onWarning?.({ code: "NUMERIC_REPAIR", message: `p${page} 숫자 보정 적용 (missing ${base.missing.length}→${bestMiss})` });
+  } else if (base.missing.length) {
+    onWarning?.({
+      code: "NUMERIC_MISMATCH",
+      message: `p${page} 숫자 검증 — kordoc 확인 숫자 누락/오독 의심: ${JSON.stringify(base.missing.slice(0, 8))} — 보정 미적용(vision 유지), 육안 확인 권장`,
+    });
+  }
+  return best;
+}
+
+export async function ocrSelectedPdfPages(
+  arrayBuffer,
+  pageNumbers,
+  { onPage, spreadPages, expectedTables, kordocByPage, onWarning } = {}
+) {
   const want = [...new Set((pageNumbers || []).filter((n) => n > 0))].sort((a, b) => a - b);
   if (!want.length) return new Map();
   const spreads = spreadPages instanceof Set ? spreadPages : new Set(spreadPages || []);
   const expTbl = expectedTables instanceof Map ? expectedTables : new Map();
+  const anchors = kordocByPage instanceof Map ? kordocByPage : new Map();
   const renderer = await openPdfRenderer(arrayBuffer);
+  const total = cfg.features.pageInfo ? renderer.pageCount : null; // '페이지 N / 총 M' 의 M
   const totalUnits = want.reduce((s, p) => s + (spreads.has(p) ? 2 : 1), 0);
 
   const texts = new Map(); // page -> merged markdown
   let done = 0;
   await mapWithLimit(want, cfg.concurrency.ocr, async (page) => {
-    // 일반 페이지(또는 분할 실패 fallback): 통짜 OCR.
+    // 일반 페이지(또는 분할 실패 fallback): 통짜 OCR. anchor 는 호출부가 펼침면/NOSPACE 결함을 이미
+    // 걸러 넣어주므로(convert.js) 여기선 받은 것만 전달. anchor/repair 는 각각 cfg.features 로 게이트.
     const wholePage = async () => {
-      const t = (await ocrPageAdaptive(renderer, page, expTbl.get(page) || 0)).trim();
+      const anchorText = cfg.features.ocrAnchor ? (anchors.get(page) || "") : "";
+      let t = (await ocrPageAdaptive(renderer, page, expTbl.get(page) || 0, anchorText)).trim();
+      // P0.5: 전사 후 kordoc 숫자 대조 → 임계 이상 누락/오독이면 보정(accept/rollback).
+      if (cfg.features.numericRepair && t && anchors.has(page)) {
+        t = (await numericRepairPage(renderer, page, t, anchors.get(page), total, onWarning)).trim();
+      }
       onPage?.(++done, totalUnits, page);
       if (t) texts.set(page, t);
     };
@@ -1103,13 +1249,14 @@ export async function ocrSelectedPdfPages(arrayBuffer, pageNumbers, { onPage, sp
     for (let h = 0; h < 2; h++) {
       let text = "";
       try {
-        text = await vllmOcrPageStrict(halves[h], page, "image/png");
+        // 펼침면 반쪽은 페이지 일부라 anchor 미전달(영역 불일치). 페이지 M 은 표시.
+        text = await vllmOcrPageStrict(halves[h], page, "image/png", { pageTotal: total });
       } catch (e) {
         if (isContextOverflow(e)) {
           console.warn(`[vllm-ocr] page ${page} half ${h} 컨텍스트 초과 — 0.7배 축소 재시도`);
           try {
             const smaller = await splitPngHalves(renderer.renderPage(page, 0.7));
-            text = await vllmOcrPageStrict(smaller[h], page, "image/png");
+            text = await vllmOcrPageStrict(smaller[h], page, "image/png", { pageTotal: total });
           } catch (e2) {
             console.warn(`[vllm-ocr] page ${page} half ${h} failed:`, e2?.message || e2);
           }

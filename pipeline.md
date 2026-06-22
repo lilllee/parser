@@ -264,12 +264,25 @@ kordoc이 성공했더라도 일부 페이지의 레이아웃이나 텍스트가
 ```text
 targets = mangled pages + spread pages
   -> 대상 페이지별 kordoc 표 개수(expectedTables) 수집
-  -> ocrSelectedPdfPages(rawBackup, targets, { spreadPages, expectedTables })
+  -> 대상 페이지별 kordoc 텍스트(anchor) 수집(kordocByPage) — 펼침면·한글 무공백 뭉침 페이지 제외
+  -> ocrSelectedPdfPages(rawBackup, targets, { spreadPages, expectedTables, kordocByPage, onWarning })
+  -> (페이지별) anchor 주입 OCR -> 숫자 보정(numeric repair) accept/rollback
   -> reflowBlocksWithOcr
   -> blocksToMarkdown
 ```
 
 펼침면 페이지는 좌/우 반쪽으로 잘라 왼쪽, 오른쪽 순서로 OCR한 뒤 합친다.
+
+**anchor 주입(P0).** reflow 대상 페이지의 kordoc 텍스트(숫자·철자 정확)를 vision OCR 의 user 보조
+입력으로 함께 넣는다. 이미지가 유일한 시각 근거이고 anchor 는 숫자/철자/읽기순서 보조다(프롬프트
+`pdfOcrAnchor`, system 은 byte 동일 유지 → prefix cache). 펼침면 반쪽·한글 무공백 뭉침(`NOSPACE_RUN`)
+결함 페이지는 영역 불일치/베끼기 붕괴 위험으로 제외한다. `VLLM_OCR_ANCHOR=0` 이면 미주입(legacy).
+
+**숫자 보정(P0.5).** 전사 후 그 페이지 kordoc 숫자와 대조해(`comparePageNumbers`) missing 이 임계
+(`VLLM_OCR_NUMERIC_REPAIR_MIN_MISMATCH`, 기본 2) 이상이면 kordoc 숫자 목록을 콕 집은 보정 프롬프트
+(`pdfOcrNumericRepair`)로 최대 `VLLM_OCR_NUMERIC_REPAIR_MAX`(기본 1)회 재호출한다. **accept 는 missing 이
+엄격히 줄고 새 extra(환각 의심)가 감소폭을 넘지 않으며 표/반복이 깨지지 않을 때만**(`acceptNumericRepair`),
+아니면 rollback(원본 유지). 보정 실패 시 남은 불일치는 `onWarning`(NUMERIC_MISMATCH)로 표면화한다.
 
 OCR 결과 검증:
 
@@ -287,12 +300,16 @@ OCR 결과 검증:
 |---|---|---|
 | Markdown 이미지 reference | kordoc이 추출한 raster 이미지와 매칭되면 분석 | AI enabled + 이미지 target 존재 |
 | Markdown 표 | 기본 비활성 | `VLLM_TABLE_ANALYSIS=1` + 표 target 존재 |
-| page visual (그림/차트 해설) | 스캔본 OCR·이미지 파일 경로에서 OCR이 렌더한 페이지 이미지를 enrich 입력으로 공급 | `VLLM_PAGE_VISUAL !== "0"` + 차트/그림 단서 페이지 존재(스캔본은 최대 `VLLM_VISUAL_PAGE_CAP`=30p) |
+| page visual (그림/차트 해설) | 스캔본 OCR·이미지 파일 경로는 OCR이 렌더한 페이지 이미지를, kordoc(텍스트 PDF) 경로는 `collectChartVisualPages`가 차트 단서 페이지를 렌더해 enrich 입력으로 공급 | `VLLM_PAGE_VISUAL !== "0"` + 차트/그림 단서 페이지 존재(스캔본은 최대 `VLLM_VISUAL_PAGE_CAP`=30p; kordoc 경로는 `VLLM_PAGE_VISUAL_REFLOW !== "0"`) |
 
 > 역할 분담: OCR 프롬프트는 **전사만** 한다(차트 값 라벨은 표로 변환하되 "> " 인용 분석은 붙이지 않음).
 > 그림/차트의 서술형 해설은 이후 `enrichMarkdown`의 page-visual 단계가 담당한다. 그래서 스캔본/이미지
-> OCR 경로는 OCR이 렌더한 페이지 이미지를 `visualPages`로 enrich에 넘긴다. (텍스트 PDF 선택 reflow
-> 페이지는 아직 page-visual 입력을 공급하지 않음 — 해당 페이지 차트는 표 전사만 남고 해설은 생략될 수 있음.)
+> OCR 경로는 OCR이 렌더한 페이지 이미지를 `visualPages`로 enrich에 넘긴다.
+>
+> (P1.5 업데이트) 텍스트 PDF(kordoc) 경로도 `collectChartVisualPages`로 차트/그림 단서 페이지를 별도
+> 렌더해 `visualPages`에 공급한다 — reflow 대상이 아닌 차트 페이지도 해설을 받는다. `## 페이지 N` 헤딩이
+> 없는 kordoc/reflow markdown 에서는 `anchorIndexForPage`가 페이지 텍스트 라인을 본문에서 찾아 앵커링한다.
+> 비차트 페이지는 enrich 가 `NO_VISUAL`로 폐기하므로 무해(비용만 — `VISUAL_CUE_RE` 사전 필터로 억제).
 
 삽입 형식:
 
@@ -608,6 +625,13 @@ Golden Markdown을 사람이 별도로 저장한 경우에만 자동 metrics 계
 | `VLLM_TABLE_ANALYSIS` | off | `1`이면 Markdown 표 enrich 활성 |
 | `VLLM_PAGE_VISUAL` | on | `0`이면 page visual enrich 비활성 |
 | `VLLM_PAGE_VISUAL_MAX_KB` | `4000` | page visual 이미지 크기 상한 |
+| `VLLM_PAGE_VISUAL_REFLOW` | on | `0`이면 kordoc(텍스트 PDF) 경로 차트/그림 enrich 비활성(P1.5). 스캔/force_ocr 경로는 무관 |
+| `VLLM_OCR_PAGE_INFO` | on | `0`이면 OCR 프롬프트 '페이지 N / 총 M' 미주입(legacy '페이지 N') (P1) |
+| `VLLM_OCR_ANCHOR` | on | `0`이면 reflow OCR 에 kordoc 텍스트레이어 anchor 미주입(legacy byte-identical) (P0) |
+| `VLLM_OCR_ANCHOR_MAX_CHARS` | `2000` | anchor user 블록 최대 길이(초과 시 표/숫자/헤더 우선 압축) |
+| `VLLM_OCR_NUMERIC_REPAIR` | on | `0`이면 reflow 숫자 불일치를 경고만(보정 재시도 없음) (P0.5) |
+| `VLLM_OCR_NUMERIC_REPAIR_MAX` | `1` | 페이지당 숫자 보정 재호출 상한(decode 병목 고려) |
+| `VLLM_OCR_NUMERIC_REPAIR_MIN_MISMATCH` | `2` | 보정 트리거 최소 missing 숫자 수(1은 경계 오독 노이즈) |
 | `BEDROCK_REGION` / `AWS_REGION` | `us-east-1` fallback | Bedrock 호출 리전 |
 | `BEDROCK_MODEL` | Claude 3.5 Sonnet v2 fallback | 단일 Bedrock 기본 모델 |
 | `BEDROCK_PROFILE` / `AWS_PROFILE` | 빈 값 | AWS profile 인증 |
