@@ -15,6 +15,17 @@ import { postprocessMarkdown, hasCrammedTable, looksLikeTocTable, hasSentenceStu
 import { collectInvisibleText, stripInvisibleFromBlocks } from "./invisible.js";
 import { detectBoundaryIssues } from "../tests/quality.mjs";
 
+// force_ocr 결정(공유): 요청 명시(force_ocr/forceOcr/ocr/mode=vision) > 서버 기본(FORCE_OCR env) > false.
+// 실제 적용 대상은 _runConvert 가 결정 — PDF 만 force(이미지는 별도 vision, HWP/HWPX/DOCX 는 kordoc).
+export function resolveForceOcr(body = {}) {
+  const boolOf = (v) => (v == null || String(v).trim() === "" ? undefined : /^(1|true|on|yes)$/i.test(String(v)));
+  let r = boolOf(body.force_ocr);
+  if (r === undefined) r = boolOf(body.forceOcr);
+  if (r === undefined) r = boolOf(body.ocr);
+  if (r === undefined && String(body.mode || "").toLowerCase() === "vision") r = true;
+  return r ?? (boolOf(process.env.FORCE_OCR) ?? false);
+}
+
 export async function runConvert(arrayBuffer, filename, sink = {}, aiConfig = resolveAiConfig()) {
   // MinerU 등 '문서 파서' 엔진은 파일을 통째 올려 한 번에 md 를 받는다 — kordoc/reflow/enrich 우회.
   if (aiConfig.provider?.parseDocument) {

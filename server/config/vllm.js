@@ -18,7 +18,9 @@ export const vllmConfig = Object.freeze({
       ocr: Number(process.env.VLLM_OCR_CONCURRENCY || 3),
     },
     timeouts: {
-      ocrMs: Number(process.env.VLLM_OCR_TIMEOUT_MS || 240000),
+      // HTML <table> 출력은 markdown 보다 토큰이 3~4배라 빽빽한 17행 표는 생성이 오래 걸린다 —
+      // 240s 면 그런 페이지가 abort 되어 통째 유실됐다. 정확도 우선이라 600s 로(env 로 조정).
+      ocrMs: Number(process.env.VLLM_OCR_TIMEOUT_MS || 600000),
     },
     render: {
       // 전사 충실도(작은 한글 글자 인식)는 해상도에 민감 — 3x 로 렌더(긴 변 cap 내에서).

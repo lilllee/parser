@@ -35,6 +35,7 @@ const els = {
   claudeCliModel: document.querySelector("#claude-cli-model"),
   codexCliModel: document.querySelector("#codex-cli-model"),
   docType: document.querySelector("#doc-type-select"),
+  forceOcr: document.querySelector("#force-ocr-toggle"),
   runSettings: document.querySelector("#run-settings"),
   settingsToggle: document.querySelector("#settings-toggle"),
   runProgress: document.querySelector("#run-progress"),
@@ -462,6 +463,7 @@ async function runProviderBatch(providers) {
         files: [state.currentFile.name],
         providers,
         docType: els.docType.value,
+        forceOcr: !!els.forceOcr?.checked,
         providerOverrides: collectProviderOverrides(),
       }),
     });
@@ -485,6 +487,7 @@ async function runPayload({ provider }) {
         file: state.currentFile.name,
         provider,
         docType: els.docType.value,
+        forceOcr: !!els.forceOcr?.checked,
         providerOverrides: collectProviderOverrides(),
       }),
     });
