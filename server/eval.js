@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, s
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { streamText } from "hono/streaming";
-import { runConvert } from "./convert.js";
+import { runConvert, resolveForceOcr } from "./convert.js";
 import { resolveAiConfig, aiPing } from "./ai.js";
 import { PROVIDER_ALIASES, PROVIDER_CHOICES } from "./providers.js";
 import { BEDROCK_EVAL_MODELS, bedrockModelForRegion, resolveBedrockEvalModel } from "./config/bedrock.js";
@@ -212,6 +212,9 @@ async function runEval(body, sink = {}) {
   const startedAt = performance.now();
   const createdAt = new Date().toISOString();
   const id = `${createdAt.replace(/[:.]/g, "-")}__${safeId(provider)}__${shortFileId(file)}`;
+
+  // force_ocr: 요청(UI 토글/배치 body) 명시 > FORCE_OCR env. sink(=runConvert 옵션)에 실어 보낸다.
+  sink.forceOcr = resolveForceOcr(body);
 
   let record;
   try {
