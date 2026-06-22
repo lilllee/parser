@@ -625,6 +625,25 @@ button:disabled {
   font-family: inherit;
 }
 
+/* force_ocr 토글: 라벨 + 체크박스 가로 정렬(전폭 stretch 방지) */
+.force-ocr-field {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.force-ocr-field input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  flex: 0 0 auto;
+  accent-color: var(--accent, #2563eb);
+}
+.force-ocr-field small {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
 .field input:focus,
 .field select:focus {
   outline: 2px solid var(--accent-soft);

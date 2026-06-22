@@ -4,7 +4,7 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import { swaggerUI } from "@hono/swagger-ui";
 import { pathToFileURL } from "node:url";
-import { runConvert } from "./convert.js";
+import { runConvert, resolveForceOcr } from "./convert.js";
 import { markdownTablesToHtml } from "./postprocess.js";
 import { resolveAiConfig } from "./ai.js";
 import { checkVllmConnection, vllmInfo, VLLM_ENABLED } from "./vllm.js";
@@ -54,14 +54,8 @@ app.post("/api/convert", async (c) => {
   // 출력 표 포맷: md(기본, 사람/RAG 가독) | html(<table>, 구조보존·ParseBench GRITS 등).
   const format = String(body.format || body.output_format || "md").toLowerCase() === "html" ? "html" : "md";
 
-  // 강제 전체페이지 vision OCR (kordoc 우회). dense 표를 kordoc 이 산산조각 내는 PDF용. vision provider 필요.
-  // 우선순위: 요청 명시(force_ocr/ocr/mode=vision) > 서버 기본(FORCE_OCR env). 셋 다 없으면 false.
-  // 적용 대상은 convert 가 결정 — PDF 만 force(이미지는 별도 vision 경로, HWP/HWPX/DOCX 는 kordoc 유지).
-  const boolOf = (v) => (v == null || String(v).trim() === "" ? undefined : /^(1|true|on|yes)$/i.test(String(v)));
-  let reqForce = boolOf(body.force_ocr);
-  if (reqForce === undefined) reqForce = boolOf(body.ocr);
-  if (reqForce === undefined && String(body.mode || "").toLowerCase() === "vision") reqForce = true;
-  const forceOcr = reqForce ?? (boolOf(process.env.FORCE_OCR) ?? false);
+  // 강제 전체페이지 vision OCR (kordoc 우회). 요청 명시 > FORCE_OCR env. PDF 만 적용(convert 게이트).
+  const forceOcr = resolveForceOcr(body);
 
   try {
     const result = await runConvert(arrayBuffer, filename, { forceOcr }, aiConfig);
