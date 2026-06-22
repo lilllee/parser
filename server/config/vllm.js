@@ -4,9 +4,11 @@ export const vllmConfig = Object.freeze({
       pageVisualImageKb: Number(process.env.VLLM_PAGE_VISUAL_MAX_KB || 4000),
     },
     tokens: {
-      image: 512,
-      table: 256,
-      pageVisual: 640,
+      // enrich(설명) 출력 — 짧으면 차트/그림/표 설명이 중간에 끊긴다. 캡은 상한일 뿐(평균 출력 ~640tok
+      // 라 안 채우면 비용 0). 자주 튜닝하도록 env 훅 부여. (decode ~13.6tok/s 라 '채워질 때만' 느려짐.)
+      image: Number(process.env.VLLM_IMAGE_MAX_TOKENS || 1024),
+      table: Number(process.env.VLLM_TABLE_MAX_TOKENS || 1024),
+      pageVisual: Number(process.env.VLLM_PAGE_VISUAL_MAX_TOKENS || 1280),
       // OCR 은 '페이지 단위' 호출이라 출력 8192(≈6000+단어/페이지)면 어떤 빽빽한 전면 표·명단도
       // 한 번에 담긴다. 서버는 출력에 별도 캡이 없고 입력+출력 ≤ max_model_len(32768)만 제약 —
       // 2600px 이미지(~6~8K tok)+프롬프트 입력에 8192 출력이면 합쳐 ~16K 로 안전(2배 여유).
