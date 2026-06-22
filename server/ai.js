@@ -49,8 +49,9 @@ function currentAiConfig() {
   return aiStore.getStore() || resolveAiConfig();
 }
 
-// 토큰 한도 잘림(finish_reason=length 등) 시 max_tokens 를 키워 재시도하는 상한.
-const MAX_TOKENS_CAP = Number(process.env.AI_MAX_TOKENS_CAP || 8192);
+// 토큰 한도 잘림(finish_reason=length) 시 max_tokens 를 2배씩 키워 재시도하는 상한. OCR 기본이 8192 라(페이지 단위)
+// 헤드룸 확보 위해 16384 — 이미지 입력(~8K)+출력 16384 = ~24K 로 max_model_len(32768) 내 안전.
+const MAX_TOKENS_CAP = Number(process.env.AI_MAX_TOKENS_CAP || 16384);
 
 // provider 별 응답에서 "출력이 토큰 한도에서 잘렸는가"를 판별 (OpenAI/vLLM · Anthropic · Gemini).
 function isTruncated(json) {

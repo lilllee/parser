@@ -7,9 +7,11 @@ export const vllmConfig = Object.freeze({
       image: 512,
       table: 256,
       pageVisual: 640,
-      // 전면 통계표·명단 같은 빽빽한 페이지는 2000 으로 잘려(truncation) 재시도에 의존했다(보육 실측).
-      // 정확도/완전성 우선이라 4096 으로 올려 한 번에 담는다(잘림 시 ai.js 가 8192 까지 추가 확대).
-      ocr: Number(process.env.VLLM_OCR_MAX_TOKENS || 4096),
+      // OCR 은 '페이지 단위' 호출이라 출력 8192(≈6000+단어/페이지)면 어떤 빽빽한 전면 표·명단도
+      // 한 번에 담긴다. 서버는 출력에 별도 캡이 없고 입력+출력 ≤ max_model_len(32768)만 제약 —
+      // 2600px 이미지(~6~8K tok)+프롬프트 입력에 8192 출력이면 합쳐 ~16K 로 안전(2배 여유).
+      // (그래도 잘리면 ai.js 가 AI_MAX_TOKENS_CAP 까지 확대.) env VLLM_OCR_MAX_TOKENS 로 조정.
+      ocr: Number(process.env.VLLM_OCR_MAX_TOKENS || 8192),
     },
     concurrency: {
       enrich: Number(process.env.VLLM_CONCURRENCY || 3),
