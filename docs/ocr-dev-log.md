@@ -71,16 +71,42 @@ kordoc 텍스트레이어(숫자 정확)를 **사후 검증에만 쓰고 생성 
 
 ---
 
-## 벤치 결과 (채워짐: 진행 중)
+## 2026-06-23 — ⚠ 서버 A model id 변경 발견(404) + Phase 3 벤치 결과
 
-_(paddle_bench.mjs 완료 후 추가)_
+**enrich 0/5 의 진짜 원인은 타임아웃이 아니라 404였다.** 벤치 돌리니 모든 Qwen 호출이
+`model Intel/Qwen3.5-122B-A10B-int4-AutoRound does not exist (404)`. 서버 A 재배포로 `/v1/models`
+실제 id 가 **`qwen3.5-122b`** 로 바뀜. → `.env`/providers.js/.env.example VLLM_MODEL 갱신(commit e7788f3).
+(enrich 타임아웃 분리 d0bc880 도 유효 — 모델 살아난 뒤 122B vision 이 60s 넘으므로.)
+- **교훈: Qwen 호출 실패 시 1순위로 서버 `/v1/models` 실제 id 와 VLLM_MODEL 일치 점검.**
+- **함정: `ai.js loadLocalEnv()` 의 PRIORITY 정규식(`VLLM_|AI_|OPENAI_|...`)이 .env 값으로 inline env 를 덮어쓴다.** 그래서 `VLLM_PAGE_VISUAL=0 node ...` 인라인이 .env 의 `VLLM_PAGE_VISUAL=1` 에 무시됨(벤치 enrich 격리 실패 — 대신 enrich-on 으로 측정됨). 런타임 오버라이드하려면 .env 를 고치거나 PRIORITY 밖 키를 쓸 것.
+
+**Phase 3 벤치(모델ID 수정 후, enrich on, reflow 발생 2문서):**
+
+| 문서 | 백엔드 | 시간 | md자 | problemTotal | enrich | kordoc숫자 missing | extra |
+|---|---|---:|---:|---:|---|---:|---:|
+| 인구동향(933숫자) | qwen | **331s** | 19848 | 0 | 5/5 | **0** | 83 |
+| 인구동향 | **paddle** | **54s** | 18638 | 0 | 5/5 | **0** | 37 |
+| 입양실무(비교표) | qwen | 193s | 15090 | 2 | (skip) | 1 | 2 |
+| 입양실무 | **paddle** | **54s** | 12746 | 2 | (skip) | 1 | 2 |
+
+**판정:**
+- **Paddle OCR 3.6~6배 빠름** (인구동향 331→54s, 입양 193→54s) — 122B decode 병목 해소 확인.
+- **품질 동등**: problemTotal 동일(0/0, 2/2), **kordoc 숫자 missing 동일(0, 1)** → 숫자 손실 없음. 숫자 게이트가 작동(missing 0 = Paddle 표가 kordoc 숫자 보존).
+- enrich **5/5 정상화**(이전 0/5 = 404). 모델ID+타임아웃 수정 합작.
+- 미해명(낮음): 인구동향 extra 가 qwen 83 vs paddle 37 — qwen 이 kordoc 밖 숫자(차트 내부 등)를 더 전사했거나 환각. missing=0 이라 손실은 아님. 출력 직접 diff 로 후속 확인 권장.
+
+**결정: reflow OCR 기본을 paddle 로 전환(.env `OCR_BACKEND=paddle`).** 근거 = 4~6배 속도 + 측정 품질 무회귀 + 숫자게이트 폴백(불일치 시 kordoc 유지)이라 하방 제한. 단 **표본 2문서**라 코드 기본값은 qwen 유지(되돌리기 1줄). 확대 코퍼스 + extra diff 후 코드 기본 전환 검토.
+
+## 벤치 결과 (위 표 참조)
 
 ---
 
 ## 다음 할 일 (백로그)
 
-- [ ] Phase 3 벤치 결과로 OCR_BACKEND default 전환 판단(통과 시 paddle).
-- [ ] Phase 2: force_ocr 경로 `/parse(전체 PDF)` 결선.
+- [x] ~~Phase 3 벤치 → OCR_BACKEND default 판단~~ → **paddle 채택, `.env OCR_BACKEND=paddle` 활성화**(코드 기본은 qwen 유지).
+- [ ] extra 숫자 diff(인구동향 qwen 83 vs paddle 37) — 출력 직접 비교로 환각/누락 여부 확인. 확대 코퍼스 벤치 후 **코드 기본값**도 paddle 로 전환 검토.
+- [ ] Phase 2: force_ocr 경로 `/parse(전체 PDF)` 결선. **부분 가능**: 지금도 `provider=paddle_parse`(document-parser)로 파일 통째 /parse 호출 가능 — forceOcr 플래그 경로에 자동 연결은 미구현.
 - [ ] Paddle 셀 `\n`/style 잔여 정규화(서버 clean_html 로 대부분 해소 — 잔여만 postprocess).
 - [ ] rotation: 회전 샘플 확보되면 재개.
 - [ ] /parse 직렬 처리량 병목 시 서버 replica 스케일 요청(목표 동시문서수 측정 후).
+- [ ] (관측성) `VLLM_PAGE_VISUAL=0` 같은 VLLM_ 키 런타임 오버라이드가 loadLocalEnv PRIORITY 에 막힘 — 측정 격리 필요 시 .env 직접 편집 or PRIORITY 예외 검토.
