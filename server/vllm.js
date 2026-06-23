@@ -10,7 +10,9 @@ export const VLLM_ENABLED = AI_ENABLED;
 export const vllmInfo = aiInfo;
 export const checkVllmConnection = aiCheck;
 
-const aiCall = (opts) => aiComplete({ maxTokens: cfg.tokens.image, ...opts });
+// enrich 기본 타임아웃을 enrichMs 로(공용 60s 는 122B vision 해설에 너무 짧아 abort→fail). OCR 호출은
+// opts 에 timeoutMs(ocrMs)를 명시하므로 그게 우선한다(...opts 가 뒤).
+const aiCall = (opts) => aiComplete({ maxTokens: cfg.tokens.image, timeoutMs: cfg.timeouts.enrichMs, ...opts });
 
 export async function enrichMarkdown(
   markdown,
