@@ -63,5 +63,8 @@ export const vllmConfig = Object.freeze({
       // reflow 페이지 vision 전사 후 kordoc 숫자와 대조해 누락/오독이 임계 이상이면 보정 재호출
       // (accept/rollback). 끄면(=0) 보정 없이 불일치만 경고. force_ocr 는 별도 경로(현행 경고 유지).
       numericRepair: process.env.VLLM_OCR_NUMERIC_REPAIR !== "0",
+      // reflow 페이지 OCR 엔진 선택. "qwen"(기본)=서버 A vision chat / "paddle"=서버 B doc-parser
+      // (/api/v1/parse, HTML 표 복원·빠름). paddle 은 PADDLE_PARSE_URL 설정 시에만 동작(미설정 시 qwen).
+      ocrBackend: process.env.OCR_BACKEND || "qwen",
     },
 });

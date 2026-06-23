@@ -427,13 +427,22 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
       // - 펼침면(좌우 반쪽 OCR)은 영역 불일치 → 제외.
       // - 한글 무공백 뭉침(NOSPACE_RUN) 결함 페이지는 베끼면 한글 붕괴 → 제외(D2). (그 페이지는 repair 도 생략)
       // - 둘 다 =0 이면 빈 Map → anchor·repair 미적용(legacy byte-identical).
+      // 두 Map 분리(코드리뷰 반영):
+      //  · kordocByPage     = anchor 주입(Qwen) + numeric repair(Qwen) — NOSPACE_RUN(무공백 뭉침) 페이지는
+      //    베끼면 한글 붕괴 → 제외(D2). Qwen 경로 동작 보존.
+      //  · kordocGateByPage = Paddle 숫자 게이트 ground-truth — comparePageNumbers 는 숫자 토큰만 보므로
+      //    NOSPACE 페이지도 포함해야 한다(가장 검증 필요한 결함 페이지에서 무검증 채택 방지).
       const kordocByPage = new Map();
-      if (process.env.VLLM_OCR_ANCHOR !== "0" || process.env.VLLM_OCR_NUMERIC_REPAIR !== "0") {
+      const kordocGateByPage = new Map();
+      const wantQwenKordoc = process.env.VLLM_OCR_ANCHOR !== "0" || process.env.VLLM_OCR_NUMERIC_REPAIR !== "0";
+      const paddleBackend = process.env.OCR_BACKEND === "paddle";
+      if (wantQwenKordoc || paddleBackend) {
         for (const pn of targets) {
-          if (spreadForOcr.has(pn)) continue;
+          if (spreadForOcr.has(pn)) continue; // 펼침면은 좌우 반쪽 OCR — wholePage/게이트 대상 아님
           const a = blocksToMarkdown(blocksByPage.get(pn) || []);
-          if (!a || a.trim().length < 20 || NOSPACE_RUN.test(a)) continue;
-          kordocByPage.set(pn, a);
+          if (!a || a.trim().length < 20) continue;
+          if (paddleBackend) kordocGateByPage.set(pn, a); // Paddle 게이트: NOSPACE 포함
+          if (wantQwenKordoc && !NOSPACE_RUN.test(a)) kordocByPage.set(pn, a); // anchor/repair(Qwen): NOSPACE 제외(기존)
         }
       }
       try {
@@ -441,6 +450,7 @@ async function _runConvert(arrayBuffer, filename, sink, enabled, vision = true) 
           spreadPages: spreadForOcr,
           expectedTables,
           kordocByPage,
+          kordocGateByPage,
           onWarning,
           onPage: (i, total, pn) =>
             onPhase({ phase: "ocr", message: `vision 재추출 ${i}/${total} (p${pn})` }),

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { fromIni } from "@aws-sdk/credential-providers";
+import { paddleParseFile, paddleHealth } from "./paddle.js";
 
 function openaiChatParse(json) {
   const msg = json?.choices?.[0]?.message;
@@ -611,6 +612,32 @@ const mineruProvider = {
   pingPrompt: "health",
 };
 
+// PaddleOCR-VL doc-parser(/api/v1/parse @ :8500) — 파일 통째 업로드 → 레이아웃+HTML표+bbox 구조화 md.
+// MinerU 와 같은 document-parser(파일 단위) — convert 가 만나면 kordoc/reflow/enrich 파이프라인 우회.
+// (reflow 경로의 페이지 단위 결선은 vllm.js paddleReflowPage + OCR_BACKEND=paddle 가 담당 — 별개.)
+const paddleParseProvider = {
+  id: "paddle-parse",
+  kind: "document-parser",
+  fields: ["url", "timeout_ms"],
+  defaults: () => ({
+    url: process.env.PADDLE_PARSE_URL || "",
+    timeout_ms: Number(process.env.PADDLE_PARSE_TIMEOUT_MS || 600_000),
+  }),
+  enabled: (cfg) => !!cfg.url && process.env.PADDLE_DISABLED !== "1",
+  info: (cfg) => ({ url: cfg.url }),
+  async ping(cfg) {
+    await paddleHealth(cfg.url);
+    return { text: "healthy", url: cfg.url };
+  },
+  async parseDocument(cfg, { buffer, filename, onPhase = () => {} }) {
+    onPhase({ phase: "parse", message: `PaddleOCR-VL /parse → ${cfg.url}` });
+    const r = await paddleParseFile(buffer, filename, undefined, { url: cfg.url, timeoutMs: cfg.timeout_ms });
+    if (!r.markdown) throw new Error("Paddle /parse 응답에 markdown 이 없음");
+    return { markdown: r.markdown, pageCount: r.pageCount, metadata: { source: "paddle-parse", pages: r.pages?.length } };
+  },
+  pingPrompt: "health",
+};
+
 export const PROVIDERS = {
   vllm: vllmProvider,
   openai: openaiProvider,
@@ -621,8 +648,9 @@ export const PROVIDERS = {
   "claude-cli": claudeCliProvider,
   "codex-cli": codexCliProvider,
   mineru: mineruProvider,
+  "paddle-parse": paddleParseProvider,
 };
 
-export const PROVIDER_ALIASES = { claude_cli: "claude-cli", codex_cli: "codex-cli" };
+export const PROVIDER_ALIASES = { claude_cli: "claude-cli", codex_cli: "codex-cli", paddle_parse: "paddle-parse", paddle: "paddle-parse" };
 
-export const PROVIDER_CHOICES = ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli", "mineru"];
+export const PROVIDER_CHOICES = ["vllm", "openai", "anthropic", "gemini", "bedrock", "claude_cli", "codex_cli", "mineru", "paddle_parse"];
