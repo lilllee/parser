@@ -30,6 +30,9 @@ export const vllmConfig = Object.freeze({
       // HTML <table> 출력은 markdown 보다 토큰이 3~4배라 빽빽한 17행 표는 생성이 오래 걸린다 —
       // 240s 면 그런 페이지가 abort 되어 통째 유실됐다. 정확도 우선이라 600s 로(env 로 조정).
       ocrMs: Number(process.env.VLLM_OCR_TIMEOUT_MS || 600000),
+      // enrich(이미지/표/차트 해설) 호출은 공용 AI_TIMEOUT_MS(60s)를 쓰면 122B vision(~13.6tok/s,
+      // 1280tok ≈ 90s+)이 60s 에서 abort 돼 통째 fail 한다(차트해설 0/N). enrich 전용 240s 로 분리.
+      enrichMs: Number(process.env.VLLM_ENRICH_TIMEOUT_MS || 240000),
     },
     render: {
       // 전사 충실도(작은 한글 글자 인식)는 해상도에 민감 — 3x 로 렌더(긴 변 cap 내에서).
@@ -63,5 +66,8 @@ export const vllmConfig = Object.freeze({
       // reflow 페이지 vision 전사 후 kordoc 숫자와 대조해 누락/오독이 임계 이상이면 보정 재호출
       // (accept/rollback). 끄면(=0) 보정 없이 불일치만 경고. force_ocr 는 별도 경로(현행 경고 유지).
       numericRepair: process.env.VLLM_OCR_NUMERIC_REPAIR !== "0",
+      // reflow 페이지 OCR 엔진 선택. "qwen"(기본)=서버 A vision chat / "paddle"=서버 B doc-parser
+      // (/api/v1/parse, HTML 표 복원·빠름). paddle 은 PADDLE_PARSE_URL 설정 시에만 동작(미설정 시 qwen).
+      ocrBackend: process.env.OCR_BACKEND || "qwen",
     },
 });

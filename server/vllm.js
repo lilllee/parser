@@ -4,12 +4,15 @@ import { aiComplete, aiCheck, aiInfo, AI_ENABLED, formatAiError } from "./ai.js"
 import { vllmConfig as cfg } from "./config/vllm.js";
 import { vllmPrompts as prompts } from "./config/prompt.js";
 import { comparePageNumbers } from "./postprocess.js";
+import { paddleParsePageImage, PADDLE_PARSE_ENABLED } from "./paddle.js";
 
 export const VLLM_ENABLED = AI_ENABLED;
 export const vllmInfo = aiInfo;
 export const checkVllmConnection = aiCheck;
 
-const aiCall = (opts) => aiComplete({ maxTokens: cfg.tokens.image, ...opts });
+// enrich 기본 타임아웃을 enrichMs 로(공용 60s 는 122B vision 해설에 너무 짧아 abort→fail). OCR 호출은
+// opts 에 timeoutMs(ocrMs)를 명시하므로 그게 우선한다(...opts 가 뒤).
+const aiCall = (opts) => aiComplete({ maxTokens: cfg.tokens.image, timeoutMs: cfg.timeouts.enrichMs, ...opts });
 
 export async function enrichMarkdown(
   markdown,
@@ -1204,16 +1207,52 @@ async function numericRepairPage(renderer, page, visionText, kordocText, pageTot
   return best;
 }
 
+// Paddle 페이지 렌더 배율(scaleFactor). 기본 1 = 기존 ocrScale 그대로(Qwen 튜닝값, 실측 통과). Paddle
+// 레이아웃 모델에 최적 해상도가 다르면 PADDLE_RENDER_FACTOR 로 조정(서버 dpi 는 PDF 입력용이라 PNG 경로엔 무효).
+const PADDLE_RENDER_FACTOR = Number(process.env.PADDLE_RENDER_FACTOR ?? 1);
+
+// Paddle doc-parser(/api/v1/parse)로 페이지 재추출 + 숫자 게이트(필수). 게이트 실패/오류면 ""(빈값)
+// → reflow 가 그 페이지 kordoc 원본을 유지한다. /parse 내부 직렬 큐가 동시 호출을 막는다.
+// gateText = 숫자 검증 ground-truth(kordoc). anchor 와 달리 NOSPACE 페이지도 포함해야 한다 —
+// comparePageNumbers 는 숫자 토큰만 보므로 무공백 한글이 대조를 해치지 않고, 그 결함 페이지일수록 검증이 필요.
+async function paddleReflowPage(renderer, page, gateText, onWarning) {
+  let png;
+  try { png = renderer.renderPage(page, PADDLE_RENDER_FACTOR); } catch (e) { console.warn(`[paddle] page ${page} render 실패:`, e?.message || e); return ""; }
+  let md;
+  try {
+    md = cleanOcrText(await paddleParsePageImage(png)).trim();
+  } catch (e) {
+    console.warn(`[paddle] page ${page} /parse 실패 → kordoc 유지:`, e?.message || e);
+    return "";
+  }
+  if (!md) return "";
+  // 숫자 게이트: Paddle 표를 kordoc 숫자와 대조 — 불일치가 임계 이상이면 폐기(kordoc 유지). VLM 이라
+  // 구조는 멀쩡해도 셀 숫자가 틀릴 수 있으므로(서버팀 확인) 채택 전 필수 검증.
+  if (gateText) {
+    const cmp = comparePageNumbers(gateText, md);
+    if (!cmp.ok && cmp.missing.length >= cfg.limits.numericRepairMinMismatch) {
+      console.warn(`[paddle] page ${page} 숫자 불일치 ${cmp.missing.length} — Paddle 폐기(kordoc 유지)`);
+      onWarning?.({ code: "NUMERIC_MISMATCH", message: `p${page} Paddle 숫자 불일치 ${JSON.stringify(cmp.missing.slice(0, 8))} — Paddle 폐기, kordoc 유지` });
+      return "";
+    }
+  } else {
+    // ground-truth 없는 페이지(빈 kordoc) — 검증 불가, Paddle 결과가 유일 출력이므로 채택하되 로그.
+    console.warn(`[paddle] page ${page} 게이트 ground-truth 없음 — 검증 없이 채택`);
+  }
+  return md;
+}
+
 export async function ocrSelectedPdfPages(
   arrayBuffer,
   pageNumbers,
-  { onPage, spreadPages, expectedTables, kordocByPage, onWarning } = {}
+  { onPage, spreadPages, expectedTables, kordocByPage, kordocGateByPage, onWarning } = {}
 ) {
   const want = [...new Set((pageNumbers || []).filter((n) => n > 0))].sort((a, b) => a - b);
   if (!want.length) return new Map();
   const spreads = spreadPages instanceof Set ? spreadPages : new Set(spreadPages || []);
   const expTbl = expectedTables instanceof Map ? expectedTables : new Map();
-  const anchors = kordocByPage instanceof Map ? kordocByPage : new Map();
+  const anchors = kordocByPage instanceof Map ? kordocByPage : new Map(); // anchor 주입(Qwen) — NOSPACE 제외
+  const gates = kordocGateByPage instanceof Map ? kordocGateByPage : new Map(); // 숫자 게이트(Paddle) — NOSPACE 포함
   const renderer = await openPdfRenderer(arrayBuffer);
   const total = cfg.features.pageInfo ? renderer.pageCount : null; // '페이지 N / 총 M' 의 M
   const totalUnits = want.reduce((s, p) => s + (spreads.has(p) ? 2 : 1), 0);
@@ -1224,11 +1263,19 @@ export async function ocrSelectedPdfPages(
     // 일반 페이지(또는 분할 실패 fallback): 통짜 OCR. anchor 는 호출부가 펼침면/NOSPACE 결함을 이미
     // 걸러 넣어주므로(convert.js) 여기선 받은 것만 전달. anchor/repair 는 각각 cfg.features 로 게이트.
     const wholePage = async () => {
-      const anchorText = cfg.features.ocrAnchor ? (anchors.get(page) || "") : "";
-      let t = (await ocrPageAdaptive(renderer, page, expTbl.get(page) || 0, anchorText)).trim();
-      // P0.5: 전사 후 kordoc 숫자 대조 → 임계 이상 누락/오독이면 보정(accept/rollback).
-      if (cfg.features.numericRepair && t && anchors.has(page)) {
-        t = (await numericRepairPage(renderer, page, t, anchors.get(page), total, onWarning)).trim();
+      let t;
+      if (cfg.features.ocrBackend === "paddle" && PADDLE_PARSE_ENABLED()) {
+        // Paddle doc-parser 경로: 페이지 PNG → /api/v1/parse(HTML 표). 숫자 게이트(gate map, NOSPACE 포함)
+        // 통과분만 채택 — 가장 검증 필요한 결함(NOSPACE) 페이지에서도 게이트가 비지 않게.
+        t = await paddleReflowPage(renderer, page, gates.get(page) || "", onWarning);
+      } else {
+        // Qwen 경로(기존 그대로): anchor 는 NOSPACE 제외 anchors map, repair 도 같은 map(동작 보존).
+        const anchorText = cfg.features.ocrAnchor ? (anchors.get(page) || "") : "";
+        t = (await ocrPageAdaptive(renderer, page, expTbl.get(page) || 0, anchorText)).trim();
+        // P0.5: 전사 후 kordoc 숫자 대조 → 임계 이상 누락/오독이면 보정(accept/rollback).
+        if (cfg.features.numericRepair && t && anchors.has(page)) {
+          t = (await numericRepairPage(renderer, page, t, anchors.get(page), total, onWarning)).trim();
+        }
       }
       onPage?.(++done, totalUnits, page);
       if (t) texts.set(page, t);
