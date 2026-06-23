@@ -27,7 +27,7 @@ const vllmProvider = {
   supportsSystem: true,
   defaults: () => ({
     url: process.env.VLLM_URL || "",
-    model: process.env.VLLM_MODEL || "Intel/Qwen3.5-122B-A10B-int4-AutoRound",
+    model: process.env.VLLM_MODEL || "qwen3.5-122b", // 서버 A /v1/models 의 실제 id 와 일치 필요(틀리면 404)
     thinking: process.env.VLLM_THINKING === "1",
   }),
   enabled: (cfg) => !!cfg.url && process.env.VLLM_DISABLED !== "1",
