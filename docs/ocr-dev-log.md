@@ -21,6 +21,26 @@
 
 ---
 
+## 2026-06-23 — 독립 측정(Excel 리포트)로 "PDF=Paddle 우세" 확정
+
+사용자 제공 측정 리포트 2종(`parsing_comparison_report.xlsx`, `population_parsing_comparison_report.xlsx`)
+— 페이지별 Token/Numeric F1 + 표 구조 점수 하베스트(내 measure.mjs 보다 정밀). **결론: PDF 파싱은 Paddle 우세 확정.**
+
+| 문서 | VLLM 종합 | Paddle 종합 | 핵심 |
+|---|---:|---:|---|
+| source.pdf(3p, 표중심) | 71.74 | **94.07** | 표 구조 압승(p.20 운영시간 45→90, p.21 비교표 25→95), 표검출 3→5 |
+| 인구동향 5-10 | 75.2 | **95.8** | coverage 0.83→1.0, bad_pages 3→1, numericF1 0.74→0.95 |
+| 인구동향 45-50 | 62.5 | **74.4** | coverage 0.67→1.0(VLLM 페이지 2개 통째 누락) |
+
+**확정/뉘앙스:**
+- **Paddle 가 거의 전 항목 우세** — 특히 표 구조/병합(VLLM 약점)과 **page coverage**(VLLM 은 페이지를 통째 누락: 5-10 p2, 45-50 p2·p3 present=False). → `OCR_BACKEND=paddle` 결정(이미 적용) 독립 측정으로 뒷받침됨.
+- **숫자 게이트의 가치 재확인(필수)**: Paddle 도 완벽 아님 — 인구동향 45-50 **p.4 token_f1 0.12**(1/4분기 헤더를 표로 오인식), 45-50 p.1 박스글리프(ㅁㅁㅁ). 우리 numeric 게이트(kordoc 대조 불일치→폐기·kordoc 폴백)가 정확히 이런 페이지를 잡는다. **Paddle 무지성 신뢰 금물**이라는 서버팀 경고와 정합.
+- **Number precision 주의(측정 아티팩트)**: source.pdf 에서 Paddle Number precision 79.35 vs VLLM 100, Number F1 도 Paddle 87.95 < VLLM 91.18. 리포트 주석: **Paddle HTML 표 속성(colspan/rowspan 등) 숫자가 number 추출에 누출**돼 false positive. 즉 데이터 손상이 아니라 지표 잡음(우리 comparePageNumbers 는 유의숫자 3자리+ 필터라 colspan="2" 류는 대부분 제외 — 영향 작음). 그래도 number 추출 시 HTML 속성 strip 권장.
+- VLLM 이 이긴 유일 항목: source.pdf "OCR 노타/페이지 정리"(90 vs 80) — Paddle 이 그림 캡션·VOICEYE·머리글 노타를 더 끌어옴(잡음). 사소.
+
+→ **종합: 사용자 가설("PDF는 Paddle 이 제일 낫다") 맞음.** 우리 방향(reflow 기본 paddle + 숫자게이트 + kordoc 폴백)이 정답. 활성화는 **명시적 `OCR_BACKEND=paddle` env**(이미 `.env` 적용)로 유지.
+- ⚠ **코드 기본값(config)을 paddle 로 바꾸지 말 것 (현 상태)**: `convert.js` 의 게이트 map 빌드가 `process.env.OCR_BACKEND === "paddle"` 를 직접 보는데, config 기본만 paddle 로 바꾸면 env 미설정 시 cfg.features.ocrBackend=paddle 인데 게이트 map 은 안 만들어져 **무게이트 Paddle** 이 된다. 코드 기본 전환하려면 먼저 convert.js 가 cfg.features.ocrBackend 를 읽도록 단일화(backlog).
+
 ## 2026-06-23 — Paddle API 업데이트 검토(`/parse_rich` 신규) + 판단
 
 서버팀 API 문서 갱신. 라이브 확인(`/openapi.json`): `/api/v1/parse`, **`/api/v1/parse_rich`**,
@@ -121,7 +141,8 @@ kordoc 텍스트레이어(숫자 정확)를 **사후 검증에만 쓰고 생성 
 ## 다음 할 일 (백로그)
 
 - [x] ~~Phase 3 벤치 → OCR_BACKEND default 판단~~ → **paddle 채택, `.env OCR_BACKEND=paddle` 활성화**(코드 기본은 qwen 유지).
-- [ ] extra 숫자 diff(인구동향 qwen 83 vs paddle 37) — 출력 직접 비교로 환각/누락 여부 확인. 확대 코퍼스 벤치 후 **코드 기본값**도 paddle 로 전환 검토.
+- [ ] **OCR_BACKEND 단일 소스화**: convert.js 가 게이트 map 빌드에서 `process.env.OCR_BACKEND` 를 직접 보는 것을 `cfg.features.ocrBackend` 로 통일 → 그 후에야 코드 기본값을 paddle 로 안전 전환 가능.
+- [x] ~~extra 숫자 (qwen 83 vs paddle 37)~~ → 독립 측정으로 규명: Paddle HTML 표 속성(colspan 등) 숫자 누출 = 측정 아티팩트(데이터 손상 아님). number 추출 시 HTML strip 권장.
 - [ ] Phase 2: force_ocr 경로 `/parse(전체 PDF)` 결선. **부분 가능**: 지금도 `provider=paddle_parse`(document-parser)로 파일 통째 /parse 호출 가능 — forceOcr 플래그 경로에 자동 연결은 미구현.
 - [ ] **이미지 파일 경로(`ocrImageBuffer`) → Paddle 라우팅** (신규 후보, 효과 큼): 현재 이미지 파일은 서버 A Qwen-vision(느림). 일반 이미지→`/parse`, 포스터/인포그래픽→`/parse_rich`(서버측 2-pass). kordoc 없는 입력이라 numeric 게이트 손실 없음.
 - [ ] Paddle 셀 `\n`/style 잔여 정규화(서버 clean_html 로 대부분 해소 — 잔여만 postprocess).
