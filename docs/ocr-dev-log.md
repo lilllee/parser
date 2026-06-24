@@ -21,6 +21,28 @@
 
 ---
 
+## 2026-06-24 — kordoc HWP/HWPX 품질 실측 → "HWP=PDF처럼 OCR 안전망 필요"는 틀림
+
+HWPX 3 + HWP 6 을 **kordoc(3.5.0) 단독** 추출(`acc_tmp/hwpx_kordoc.mjs`, MD→`Downloads/hwpx_kordoc_md/`).
+
+| 파일 | fileType | md자 | HTML표 | problemTotal | 비고 |
+|---|---|---:|---:|---:|---|
+| 주거지원정책.hwpx | hwpx | 1106 | 0 | 0 | ok |
+| 면접확인서.hwp.hwpx | hwpx | 6550 | 3 | 0 | 폼 표 ok |
+| 서민의금융.hwpx | hwpx | 29023 | 0 | 0 | 법령 ok |
+| 서민의금융.hwp | hwpml | 28978 | 0 | 0 | **hwpx와 동일 doc → 28978≈29023 일치** |
+| 2025 산업재해현황_표.hwp | hwp | **0** | 0 | 0 | ⚠ **완전 실패**(LENIENT_CFB_RECOVERY·PARTIAL_PARSE) |
+| 경기도 보호대상아동.hwp | hwp | 2194 | 0 | 0 | ok |
+| 비영리법인 연도말보고.hwp | hwp | 6017 | 3 | 0 | 폼 표 ok |
+| 액화석유가스 시행규칙.hwp | hwpml | 65495 | 0 | 0 | 대형 법령 ok |
+| 2026 온라인쇼핑동향.hwp | hwp | 275840 | **62** | 0 | **다단헤더 rowspan/colspan·숫자 정확(인구동향급 표를 네이티브로 완벽)** |
+
+**핵심 재판단(중요):**
+- **네이티브 HWP/HWPX 는 구조가 파일 안에 있어 kordoc 이 직접 읽는다 → OCR 보다 낫다.** PDF(렌더로 구조 손실→OCR 복구 필요)와 **근본적으로 다름.** 온라인쇼핑동향(PDF였다면 인구동향처럼 Paddle 필요했을 통계표)이 kordoc HWP 로 다단헤더·병합셀·숫자까지 완벽 추출됨.
+- → **일반 HWP→PDF→Paddle 안전망은 불필요(과설계).** 이전 브레인스토밍의 "HWP도 PDF처럼 OCR 폴백 필요" 전제는 실측으로 기각.
+- **유일한 실투자처 = 파싱 '완전 실패' HWP** (예: 산업재해현황_표.hwp → 0자, 구형 CFB 바이너리). 이건 **defect-detector(brokenTable 등)로 못 잡음**(빈 출력) → 트리거는 **빈/극저 출력 + CFB/PARTIAL_PARSE 경고**. 그때만 협소 폴백: HWP→PDF(LibreOffice+H2Orestart)→Paddle, 또는 최소 "Hancom 에서 PDF 저장 후 재업로드" 경고.
+- 부수: kordoc 3.5.0 이 node_modules 에 이미 설치됨(package.json `^3.1.1`→`^3.5.0` 정정). HWP5 표 패치(v3.4.0) 효과 확인.
+
 ## 2026-06-23 — 독립 측정(Excel 리포트)로 "PDF=Paddle 우세" 확정
 
 사용자 제공 측정 리포트 2종(`parsing_comparison_report.xlsx`, `population_parsing_comparison_report.xlsx`)
@@ -146,6 +168,7 @@ kordoc 텍스트레이어(숫자 정확)를 **사후 검증에만 쓰고 생성 
 - [ ] Phase 2: force_ocr 경로 `/parse(전체 PDF)` 결선. **부분 가능**: 지금도 `provider=paddle_parse`(document-parser)로 파일 통째 /parse 호출 가능 — forceOcr 플래그 경로에 자동 연결은 미구현.
 - [ ] **이미지 파일 경로(`ocrImageBuffer`) → Paddle 라우팅** (신규 후보, 효과 큼): 현재 이미지 파일은 서버 A Qwen-vision(느림). 일반 이미지→`/parse`, 포스터/인포그래픽→`/parse_rich`(서버측 2-pass). kordoc 없는 입력이라 numeric 게이트 손실 없음.
 - [ ] Paddle 셀 `\n`/style 잔여 정규화(서버 clean_html 로 대부분 해소 — 잔여만 postprocess).
+- [ ] **HWP 파싱 실패 폴백(협소)**: kordoc HWP/HWPX 는 대체로 우수(실측) → 일반 OCR 폴백 불필요. 단 '완전 실패' HWP(빈 출력+CFB_RECOVERY/PARTIAL_PARSE, 예 산업재해현황_표.hwp)만 HWP→PDF(LibreOffice+H2Orestart)→Paddle 폴백 또는 경고. 트리거=빈/극저 출력+경고(defect-detector 아님).
 - [ ] rotation: 회전 샘플 확보되면 재개.
 - [ ] /parse 직렬 처리량 병목 시 서버 replica 스케일 요청(목표 동시문서수 측정 후).
 - [ ] (관측성) `VLLM_PAGE_VISUAL=0` 같은 VLLM_ 키 런타임 오버라이드가 loadLocalEnv PRIORITY 에 막힘 — 측정 격리 필요 시 .env 직접 편집 or PRIORITY 예외 검토.
