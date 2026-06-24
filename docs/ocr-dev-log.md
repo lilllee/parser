@@ -21,6 +21,34 @@
 
 ---
 
+## 2026-06-24 — HWP 시각자료(임베디드 이미지) 처리 검증 → routing 설계 확정
+
+kordoc 이 HWP/HWPX 에서 이미지를 추출하므로(`acc_tmp/hwp_images.mjs`: 8파일 31이미지, 전부 `refd_in_md`),
+그 이미지를 Paddle 로 넘기는 아이디어를 실측 검증(`acc_tmp/paddle_parse_any.mjs`, `qwen_img.mjs`).
+
+**이미지 인벤토리:** 온라인쇼핑동향 22장(차트 다수), 주거지원 3, 면접확인서 4, 경기도아동 2 … 법령류 0.
+bmp/jpg/png 혼재. → HWP 도 시각자료 처리 필요.
+
+**검증 1 — 표가 이미지로 박힌 경우(주거지원 표1.bmp 1.3MB):**
+- Paddle `/parse`: bmp 수용(HTTP 200, 3.9s), **`label=table`** + **완전한 HTML 표 복원**(소득/저소득층/비정규직 … 351만원/29.3% 전 행렬 + 각주/출처). ✅
+- → kordoc 은 `![](image.bmp)` 불투명 참조, Qwen 은 묘사만. **Paddle 은 표 자체를 되살림 → overwrite 가 정답.**
+
+**검증 2 — 차트(온라인쇼핑 도넛.jpg, 값라벨有):**
+- Paddle `/parse`: **`label=chart` 분류는 정확**(범례 text 블록도 정확). 단 **chart→table 매핑은 부정확** — 음식료품→"액션", 화장품 4.6↔12.6, 중앙총계 "1조9,789"가 "관련상품 1,789"로 누출 등 다수 오매핑. ❌ 데이터로 신뢰 불가.
+- Qwen vision(imageAnalysis): 15개 카테고리 거의 정확(화장품 1건만 오류) + 중앙총계·해설 정확. ✅ **차트는 Qwen 압도.**
+
+**확정 설계 — kordoc 이미지 → Paddle `label` 라우팅:**
+| Paddle label | 처리 | 근거 |
+|---|---|---|
+| `table`/`text` | `![](img)` 자리를 **Paddle HTML 표로 overwrite** | 표 이미지 구조 완전 복원(검증1) |
+| `chart`/`figure` | overwrite 금지 → **Qwen vision**(값표+해설), 이미지 유지 | Paddle chart-table 오매핑(검증2) |
+| 로고/도장/장식 | skip | 정보 없음 |
+- **Paddle `/parse` 가 분류기(공짜)** — label 로 분기. bmp 도 수용(변환 불필요).
+- 비용: 이미지당 Paddle 1회(분류+표추출), chart 만 Qwen 추가.
+- 구현 위치: `vllm.js enrichMarkdown`/`analyzeTarget(type="image")` — 현재 "Qwen 묘사 후 삽입"을 "Paddle label 라우팅(표=치환, 차트=Qwen 해설)"으로 확장. (현 챗 enrich 와 달리 표는 치환)
+
+**HWP 종합 결론:** kordoc 네이티브(텍스트/표) + Paddle(표 이미지 overwrite·분류) + Qwen(차트/그림 해설·값) = **HWP 사실상 해결.** 남은 건 파싱 완전실패 HWP 협소 폴백(백로그)뿐.
+
 ## 2026-06-24 — kordoc HWP/HWPX 품질 실측 → "HWP=PDF처럼 OCR 안전망 필요"는 틀림
 
 HWPX 3 + HWP 6 을 **kordoc(3.5.0) 단독** 추출(`acc_tmp/hwpx_kordoc.mjs`, MD→`Downloads/hwpx_kordoc_md/`).
@@ -167,6 +195,7 @@ kordoc 텍스트레이어(숫자 정확)를 **사후 검증에만 쓰고 생성 
 - [x] ~~extra 숫자 (qwen 83 vs paddle 37)~~ → 독립 측정으로 규명: Paddle HTML 표 속성(colspan 등) 숫자 누출 = 측정 아티팩트(데이터 손상 아님). number 추출 시 HTML strip 권장.
 - [ ] Phase 2: force_ocr 경로 `/parse(전체 PDF)` 결선. **부분 가능**: 지금도 `provider=paddle_parse`(document-parser)로 파일 통째 /parse 호출 가능 — forceOcr 플래그 경로에 자동 연결은 미구현.
 - [ ] **이미지 파일 경로(`ocrImageBuffer`) → Paddle 라우팅** (신규 후보, 효과 큼): 현재 이미지 파일은 서버 A Qwen-vision(느림). 일반 이미지→`/parse`, 포스터/인포그래픽→`/parse_rich`(서버측 2-pass). kordoc 없는 입력이라 numeric 게이트 손실 없음.
+- [ ] **kordoc 추출 이미지 → Paddle label 라우팅 (검증 완료, 구현 대기)**: `enrichMarkdown`/`analyzeTarget(image)` 확장. Paddle `/parse` label 로 분기 — `table`/`text`→HTML표로 `![](img)` 치환(overwrite), `chart`/`figure`→Qwen vision 값표+해설(이미지 유지), 장식→skip. 실측: 표이미지 Paddle 완전복원, 차트 Qwen 압도(Paddle chart-table 오매핑). HWP 시각자료의 마지막 조각.
 - [ ] Paddle 셀 `\n`/style 잔여 정규화(서버 clean_html 로 대부분 해소 — 잔여만 postprocess).
 - [ ] **HWP 파싱 실패 폴백(협소)**: kordoc HWP/HWPX 는 대체로 우수(실측) → 일반 OCR 폴백 불필요. 단 '완전 실패' HWP(빈 출력+CFB_RECOVERY/PARTIAL_PARSE, 예 산업재해현황_표.hwp)만 HWP→PDF(LibreOffice+H2Orestart)→Paddle 폴백 또는 경고. 트리거=빈/극저 출력+경고(defect-detector 아님).
 - [ ] rotation: 회전 샘플 확보되면 재개.
