@@ -21,6 +21,23 @@
 
 ---
 
+## 2026-06-23 — Paddle API 업데이트 검토(`/parse_rich` 신규) + 판단
+
+서버팀 API 문서 갱신. 라이브 확인(`/openapi.json`): `/api/v1/parse`, **`/api/v1/parse_rich`**,
+`/api/v1/parse_rich_stream`, `/api/v1/ocr` 모두 배포됨.
+
+**신규 `/api/v1/parse_rich`** = 서버측 2-pass: Paddle(1차 영역 텍스트) → **Qwen-VL(2차, 페이지이미지+1차텍스트)**
+로 장식제목 교정·아이콘/일러스트 설명·마크다운 재구성. 포스터/인포그래픽용("LlamaParse급"). 느림(~수십초/page,
+122B). `markdown_rich`+`image_b64` 반환. server env `QWEN_URL`(:8000/v1)·`QWEN_MODEL`(qwen3.5-122b) — 서버팀도 우리와 같은 모델 ID 수정 반영됨. SSE: `/parse_rich_stream`.
+
+**`/api/v1/ocr` 컨텍스트 한도 명확화**: 서버 컨텍스트 **8192 tok**(`--max-num-seqs 256`) → `(이미지토큰+max_tokens) ≤ 8192`, 초과 시 **HTTP 400**. dense 페이지는 `/parse`(영역 크롭이라 무관) 권장.
+
+**판단(중요):**
+- **우리 통합 무영향** — `/parse`(clean_html/drop_images/dpi) 계약 그대로. Phase 0/1 코드 변경 불필요.
+- **`/parse_rich` 는 문서(보고서/표) 경로에 쓰지 말 것.** 이유: ① 122B 를 페이지마다 다시 태워 **방금 벗어난 decode 병목 재유입**, ② kordoc(숫자 ground-truth) 우회 + Qwen 이 전 페이지를 재작성 → **숫자 변조 위험 + 우리 numeric 게이트 무력화.** 우리는 이미 "Paddle 구조 + Qwen enrich"를 **client 측에서 선택적·숫자안전하게** 한다(차트 페이지만, kordoc 게이트). 문서엔 우리 오케스트레이션이 우월.
+- **`/parse_rich` 의 진짜 자리 = 이미지 파일 입력(포스터/인포그래픽/스크린샷).** 이미지 파일은 애초에 kordoc 이 없어(게이트 손실 없음) Paddle 단독이 약한 장식폰트/아이콘을 Qwen 보강이 메운다. 현재 이미지 파일은 `ocrImageBuffer`(서버 A Qwen-vision, 느림)로 감 → **이미지 경로를 Paddle `/parse`(일반) 또는 `/parse_rich`(포스터)로 라우팅하는 것이 다음 후속 후보.**
+- **8192 한도**: 우리 통합 경로는 `/parse`(크롭)만 써서 무관. 단 `/ocr`·`:8118` raw 를 직접 쓰면 `image+max_tokens ≤ 8192` 준수(서버 A 122B OCR 은 :8000·32768 라 별개).
+
 ## 2026-06-23 — enrich 타임아웃 수정 + Paddle 벤치
 
 **enrich 0/N fail 원인 = 타임아웃.** Paddle e2e 에서 `enrich 0/5 fail` 관측 → 진단: enrich(차트해설)는
@@ -106,6 +123,7 @@ kordoc 텍스트레이어(숫자 정확)를 **사후 검증에만 쓰고 생성 
 - [x] ~~Phase 3 벤치 → OCR_BACKEND default 판단~~ → **paddle 채택, `.env OCR_BACKEND=paddle` 활성화**(코드 기본은 qwen 유지).
 - [ ] extra 숫자 diff(인구동향 qwen 83 vs paddle 37) — 출력 직접 비교로 환각/누락 여부 확인. 확대 코퍼스 벤치 후 **코드 기본값**도 paddle 로 전환 검토.
 - [ ] Phase 2: force_ocr 경로 `/parse(전체 PDF)` 결선. **부분 가능**: 지금도 `provider=paddle_parse`(document-parser)로 파일 통째 /parse 호출 가능 — forceOcr 플래그 경로에 자동 연결은 미구현.
+- [ ] **이미지 파일 경로(`ocrImageBuffer`) → Paddle 라우팅** (신규 후보, 효과 큼): 현재 이미지 파일은 서버 A Qwen-vision(느림). 일반 이미지→`/parse`, 포스터/인포그래픽→`/parse_rich`(서버측 2-pass). kordoc 없는 입력이라 numeric 게이트 손실 없음.
 - [ ] Paddle 셀 `\n`/style 잔여 정규화(서버 clean_html 로 대부분 해소 — 잔여만 postprocess).
 - [ ] rotation: 회전 샘플 확보되면 재개.
 - [ ] /parse 직렬 처리량 병목 시 서버 replica 스케일 요청(목표 동시문서수 측정 후).
