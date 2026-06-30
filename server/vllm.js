@@ -1218,13 +1218,17 @@ const PADDLE_RENDER_FACTOR = Number(process.env.PADDLE_RENDER_FACTOR ?? 1);
 async function paddleReflowPage(renderer, page, gateText, onWarning) {
   let png;
   try { png = renderer.renderPage(page, PADDLE_RENDER_FACTOR); } catch (e) { console.warn(`[paddle] page ${page} render 실패:`, e?.message || e); return ""; }
-  let md;
+  let res;
   try {
-    md = cleanOcrText(await paddleParsePageImage(png)).trim();
+    res = await paddleParsePageImage(png);
   } catch (e) {
     console.warn(`[paddle] page ${page} /parse 실패 → kordoc 유지:`, e?.message || e);
     return "";
   }
+  // 서버 품질 경고 표면화(차트파생표·반복붕괴·환각·비직사각형표 등). 관측용 — 실제 폐기 판단은
+  // 아래 숫자게이트 + convert.js 의 hasBrokenTable 가드가 담당.
+  for (const w of res.warnings || []) onWarning?.({ code: "PADDLE_WARNING", message: `p${page} ${w}` });
+  const md = cleanOcrText(res.markdown).trim();
   if (!md) return "";
   // 숫자 게이트: Paddle 표를 kordoc 숫자와 대조 — 불일치가 임계 이상이면 폐기(kordoc 유지). VLM 이라
   // 구조는 멀쩡해도 셀 숫자가 틀릴 수 있으므로(서버팀 확인) 채택 전 필수 검증.
