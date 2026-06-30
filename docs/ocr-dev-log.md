@@ -69,7 +69,7 @@ HWPX 3 + HWP 6 을 **kordoc(3.5.0) 단독** 추출(`acc_tmp/hwpx_kordoc.mjs`, MD
 - **네이티브 HWP/HWPX 는 구조가 파일 안에 있어 kordoc 이 직접 읽는다 → OCR 보다 낫다.** PDF(렌더로 구조 손실→OCR 복구 필요)와 **근본적으로 다름.** 온라인쇼핑동향(PDF였다면 인구동향처럼 Paddle 필요했을 통계표)이 kordoc HWP 로 다단헤더·병합셀·숫자까지 완벽 추출됨.
 - → **일반 HWP→PDF→Paddle 안전망은 불필요(과설계).** 이전 브레인스토밍의 "HWP도 PDF처럼 OCR 폴백 필요" 전제는 실측으로 기각.
 - **유일한 실투자처 = 파싱 '완전 실패' HWP** (예: 산업재해현황_표.hwp → 0자, 구형 CFB 바이너리). 이건 **defect-detector(brokenTable 등)로 못 잡음**(빈 출력) → 트리거는 **빈/극저 출력 + CFB/PARTIAL_PARSE 경고**. 그때만 협소 폴백: HWP→PDF(LibreOffice+H2Orestart)→Paddle, 또는 최소 "Hancom 에서 PDF 저장 후 재업로드" 경고.
-- 부수: kordoc 3.5.0 이 node_modules 에 이미 설치됨(package.json `^3.1.1`→`^3.5.0` 정정). HWP5 표 패치(v3.4.0) 효과 확인.
+- 부수: kordoc 3.5.0→**3.5.4** 업데이트(package.json `^3.5.4`, npm 게시본). v3.5.1 hwpx 섹션해석 통합 + PR#37 **hwpx parse-hang 수정** + 공문서(gongmun) 모드 개선. **이 9파일 출력은 3.5.0과 완전 동일(회귀 0), 전체 테스트 그린.** parse-hang 수정은 행 유발 hwpx 한정이라 이 세트엔 변화 없음. #5 산업재해현황_표.hwp 는 여전히 실패(CFB 바이너리, hwpx 수정과 무관).
 
 ## 2026-06-23 — 독립 측정(Excel 리포트)로 "PDF=Paddle 우세" 확정
 
