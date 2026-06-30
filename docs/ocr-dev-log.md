@@ -21,6 +21,20 @@
 
 ---
 
+## 2026-06-24 — Paddle 서버 API 대규모 업데이트 반영
+
+서버 B `/parse` 업그레이드(DOCPARSE_API.md). 우리 통합에 반영한 것 + 인지만 한 것:
+
+**반영(코드 변경):**
+- **`pages[].warnings` 소비**: 서버가 페이지별 품질경고(차트파생표·반복degeneration·한자/외국문자 환각·비직사각형표·`NUMERIC_MISMATCH`) 반환 → `paddleParsePageImage` 가 `{markdown, warnings}` 반환, `paddleReflowPage` 가 `onWarning(PADDLE_WARNING)`로 surface. ⚠ 우린 PNG 입력이라 NUMERIC_MISMATCH(born-digital 텍스트레이어 전용)는 안 뜸 — 숫자검증은 우리 kordoc 게이트 유지.
+- **`correct_kr`/`drop_captions` 토글 노출**(`PADDLE_CORRECT_KR`/`PADDLE_DROP_CAPTIONS`, 기본 off): 한국어 지명/도메인 보정(숫자 무손상 보장) / 로고·QR·VOICEYE 노이즈 제거. 우리 postprocess 와 중복 여지 있어 측정 후 켜기.
+
+**인지(코드 변경 없음):**
+- 컨텍스트 8192→**16384**(:8118). dpi 기본 200→**400**(PDF 입력 전용 — 우린 PNG 보내 무관).
+- **born-digital PDF 텍스트레이어 융합**: 서버가 pymupdf 좌표를 ground-truth로 융합 보정(숫자 셀 불변) + NUMERIC_MISMATCH 경고. = 우리 kordoc+anchor+숫자게이트의 서버측 버전. **고려**: born-digital PDF는 PDF 통째 `/parse`로 보내면 서버가 자체 융합+검증 → 우리 kordoc 일부 대체 가능. 단 우리 선택적 reflow가 더 외과적이라 보류.
+- 서버 `NUMERIC_MISMATCH` = 우리 `comparePageNumbers`와 동일 알고리즘(유의숫자·multiset·누락2개+) — `docs/postprocess-reference.md`로 정합됨(양쪽 같은 규율).
+- ⚠ **`/parse_rich`는 2차 Qwen이 서버 A(:8000) 부하 소비** → 순수 오프로드 아님(품질용). 오프로드는 `/parse`(Qwen 0).
+
 ## 2026-06-24 — HWP 시각자료(임베디드 이미지) 처리 검증 → routing 설계 확정
 
 kordoc 이 HWP/HWPX 에서 이미지를 추출하므로(`acc_tmp/hwp_images.mjs`: 8파일 31이미지, 전부 `refd_in_md`),
